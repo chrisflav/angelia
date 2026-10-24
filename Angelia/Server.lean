@@ -426,8 +426,10 @@ def serveStatic (ctx : AppContext) (segs : List String) : Async (Response Body.F
     |>.header! "Cache-Control" "no-cache").fromBytes bytes
 
 /-- `GET /api/events`: a server-sent-events stream that says `change` whenever notifications the
-    principal may see change, and pings every 20 s so proxies keep the connection open. The event
-    carries nothing else, so a scoped token learns nothing about activity outside its scope. -/
+    principal may see change, and pings every 15 s: well inside the server's own idle limit (see
+    `serve`) and a proxy's read timeout, either of which would otherwise end a quiet stream. The
+    event carries nothing else, so a scoped token learns nothing about activity outside its
+    scope. -/
 def eventStream (ctx : AppContext) (principal : Principal) : Async (Response Body.Stream) :=
   let relevant : Change → IO Bool := fun c => match principal, c with
     | .session, _ | _, none => pure true
@@ -447,7 +449,7 @@ def eventStream (ctx : AppContext) (principal : Principal) : Async (Response Bod
         seen := now
         if ← (relevant change : IO Bool) then send "event: change\ndata: 1\n\n"
       ticks := ticks + 1
-      if ticks % 40 == 0 then send ": ping\n\n"
+      if ticks % 30 == 0 then send ": ping\n\n"
 
 structure AppHandler where
   ctx : AppContext
@@ -482,6 +484,9 @@ instance : Handler AppHandler where
 def serve (ctx : AppContext) : Async Server := do
   let ip := IPv4Addr.ofString ctx.config.host |>.getD (IPv4Addr.ofParts 127 0 0 1)
   let addr : SocketAddress := .v4 { addr := ip, port := ctx.config.port }
-  Std.Http.Server.serve addr (AppHandler.mk ctx) { maxHeaders := 256 }
+  -- `lingeringTimeout` is how long a connection may go without traffic while a request is in
+  -- progress, and an event stream is a request in progress for as long as it is open. Its 10 s
+  -- default is shorter than the ping interval, which ended every quiet stream; 30 s is twice it.
+  Std.Http.Server.serve addr (AppHandler.mk ctx) { maxHeaders := 256, lingeringTimeout := 30000 }
 
 end Angelia.Server
