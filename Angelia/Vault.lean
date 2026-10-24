@@ -124,7 +124,8 @@ private def unlockAad : ByteArray := "angelia data key, unlock key".toUTF8
 
 /-- The data key wrapped under the configured unlock key, itself a random 256-bit key, so no key
     derivation is needed. -/
-def wrapUnder (unlockKey dataKey : ByteArray) : IO ByteArray := Aead.seal unlockKey unlockAad dataKey
+def wrapUnder (unlockKey dataKey : ByteArray) : IO ByteArray :=
+  Aead.seal unlockKey unlockAad dataKey
 
 def unwrapUnder (unlockKey wrapped : ByteArray) : Option ByteArray :=
   Aead.open unlockKey unlockAad wrapped

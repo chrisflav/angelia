@@ -100,7 +100,8 @@ def main (args : List String) : IO UInt32 := do
     let db ← Db.connect config.dbPath
     Db.migrate db
     unlockFromStdin config db
-    IO.println s!"removed {← Db.deleteAllFactors db} second factor(s); signing in takes the password alone"
+    let n ← Db.deleteAllFactors db
+    IO.println s!"removed {n} second factor(s); signing in takes the password alone"
     return 0
   | ["change-password"] =>
     let config ← loadConfig args
