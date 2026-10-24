@@ -48,6 +48,8 @@ structure Config where
   /-- Session lifetime, in days since last use. -/
   sessionDays : Nat := 30
   sources : Array SourceConfig := #[]
+  /-- The whole configuration, for settings that are secrets (`unlockKey`). -/
+  json : Json := .null
 deriving Inhabited
 
 instance : FromJson Config where
@@ -70,7 +72,8 @@ instance : FromJson Config where
       origin := ← opt "origin" none
       secureCookies := ← opt "secureCookies" d.secureCookies
       sessionDays := ← opt "sessionDays" d.sessionDays
-      sources := ← opt "sources" #[] }
+      sources := ← opt "sources" #[]
+      json := j }
 
 def Config.publicOrigin (c : Config) : String :=
   (c.origin.getD s!"http://localhost:{c.port}").dropEndWhile (· == '/') |>.toString
@@ -100,5 +103,9 @@ def secret (settings : Json) (key : String) : IO (Option String) := do
       -- `pass` and friends print the secret on the first line.
       return some ((out.stdout.splitOn "\n").headD "").trimAscii.toString
   | .error _ => return none
+
+/-- The key the server unlocks with at start (`unlockKey` or `unlockKeyCommand`, 64 hex digits),
+    if one is configured. -/
+def Config.unlockKey (c : Config) : IO (Option String) := secret c.json "unlockKey"
 
 end Angelia

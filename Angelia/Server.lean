@@ -25,8 +25,10 @@ When second factors are registered, a sign-in takes the password and then a tap 
 key or a code from an authenticator app (see `Angelia.SecondFactor`); registering or removing
 one takes the password again, so a stolen session cookie cannot swap in its own.
 
-Until the first sign-in after a start the server is locked (see `Angelia.Vault`): that sign-in
-unwraps the database key and starts the sources, and everything else answers 503 meanwhile.
+With an unlock key configured the server unlocks itself at start (see `Angelia.Vault`).
+Otherwise, or until the first sign-in with an existing database takes the key up, it is locked:
+the first sign-in unwraps the database key and starts the sources, and everything else answers
+503 meanwhile.
 -/
 
 open Std.Http Std.Http.Server Std.Async Std.Net Lean
@@ -45,6 +47,8 @@ structure AppContext where
   db : Std.Mutex Db.Conn
   /-- Starts the sources; run once, by the sign-in that unlocks the server. -/
   onUnlock : IO Unit
+  /-- The configured unlock key, which a sign-in wraps the database key under. -/
+  unlockKey : Option ByteArray := none
   /-- Held while a password is checked, so attempts are made one at a time. -/
   loginLock : Std.Mutex Unit
   /-- Challenges in flight: a sign-in waiting for its second factor, or a factor being
@@ -227,9 +231,12 @@ def login (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   checkPassword ctx password
   liftIO <| ctx.loginLock.atomically do
     if !(← Vault.unlocked) then
-      ctx.withDb (Db.unlock · password)
-      log "main" "unlocked"
+      ctx.withDb (Db.unlock · password ctx.unlockKey)
+      log "main" (if ctx.unlockKey.isSome then "unlocked; from now on at start, by the unlock key"
+        else "unlocked")
       ctx.onUnlock
+    else
+      ctx.withDb (Db.ensurePasswordWrap · password)
   let keys ← ctx.dbM Db.webauthnCredentials
   let apps ← ctx.dbM Db.totpSecrets
   if keys.isEmpty && apps.isEmpty then return ← startSession ctx

@@ -142,6 +142,12 @@ def schemaSql : String := "
     last_used INTEGER
   );
 
+  -- The data key, wrapped under the configured unlock key, so the server unlocks at start.
+  CREATE TABLE IF NOT EXISTS unlock_key (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    wrapped BLOB NOT NULL
+  );
+
   -- The data key, wrapped under a key derived from the login password.
   CREATE TABLE IF NOT EXISTS keyring (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -684,9 +690,45 @@ private def wrappedKey (db : Conn) : IO (Option Vault.WrappedKey) := do
   return rows[0]?.map fun (salt, iterations, wrapped) =>
     { salt, iterations := iterations.toNatClampNeg, wrapped }
 
+private def unlockWrapped (db : Conn) : IO (Option ByteArray) := do
+  let rows ← (← db query!"SELECT wrapped FROM unlock_key" as ByteArray).toArray
+  return rows[0]?
+
+/-- Wrap the data key (the server has to be unlocked) under `unlockKey`, replacing any earlier
+    wrapping, so a changed unlock key takes effect at the next sign-in. -/
+def wrapForUnlockKey (db : Conn) (unlockKey : ByteArray) : IO Unit := do
+  let wrapped ← Vault.wrapUnder unlockKey (← Vault.keys).dataKey
+  db exec!"INSERT INTO unlock_key (id, wrapped) VALUES (1, {wrapped})
+    ON CONFLICT (id) DO UPDATE SET wrapped = excluded.wrapped"
+
+/-- Wrap the data key under the password too, if it is not yet: the fallback for a database
+    that was created unlocked by the unlock key. -/
+def ensurePasswordWrap (db : Conn) (password : String) : IO Unit := do
+  if (← wrappedKey db).isSome then return
+  let w ← Vault.WrappedKey.wrap (← Vault.keys).dataKey password
+  db exec!"INSERT INTO keyring (id, salt, iterations, wrapped)
+    VALUES (1, {w.salt}, {Int64.ofNat w.iterations}, {w.wrapped})"
+
+/-- Unlock at start with the configured unlock key. A new database gets its data key here.
+    Returns why it could not, in which case the first sign-in unlocks with the password -- and
+    then wraps the key under the unlock key, which is how an existing database takes one up. -/
+def unlockAtStart (db : Conn) (unlockKey : ByteArray) : IO (Except String Unit) := do
+  match ← unlockWrapped db with
+  | some w =>
+    let some key := Vault.unwrapUnder unlockKey w
+      | return .error "the unlock key does not open the database key (was it changed?)"
+    Vault.install key
+    return .ok ()
+  | none =>
+    if (← wrappedKey db).isSome then
+      return .error "the database key is not yet wrapped under the unlock key"
+    Vault.install (← IO.getRandomBytes 32)
+    wrapForUnlockKey db unlockKey
+    return .ok ()
+
 /-- Unlock with the login password: unwrap the data key, or on the first unlock of a new database
-    create one. -/
-def unlock (db : Conn) (password : String) : IO Unit := do
+    create one. With an unlock key configured, the data key is (re-)wrapped under it as well. -/
+def unlock (db : Conn) (password : String) (unlockKey : Option ByteArray := none) : IO Unit := do
   match ← wrappedKey db with
   | some w =>
     let some key := w.unwrap password
@@ -694,11 +736,15 @@ def unlock (db : Conn) (password : String) : IO Unit := do
           changed, it has to be changed with `angelia change-password`")
     Vault.install key
   | none =>
+    if (← unlockWrapped db).isSome then
+      throw (IO.userError "the database key is wrapped only under the unlock key, which did not \
+        open it; configure the unlock key it was created with")
     let key ← IO.getRandomBytes 32
     let w ← Vault.WrappedKey.wrap key password
     db exec!"INSERT INTO keyring (id, salt, iterations, wrapped)
       VALUES (1, {w.salt}, {Int64.ofNat w.iterations}, {w.wrapped})"
     Vault.install key
+  if let some k := unlockKey then wrapForUnlockKey db k
 
 /-- Re-wrap the data key under a new password. The content stays as it is. -/
 def changePassword (db : Conn) (old new : String) : IO Unit := do

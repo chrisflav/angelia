@@ -5,7 +5,8 @@ open Angelia Angelia.Server Std.Async
 def usage : String := "usage: angelia [serve | replay [--source NAME] | hash-password
               | change-password | reset-second-factors] [--config PATH]
 
-  serve             run the server; the sources start at the first sign-in (default)
+  serve             run the server and its sources (default); without an unlock key, the
+                    sources start at the first sign-in
   replay            re-derive notifications from the stored raw events; reads the password
                     on stdin
   hash-password     read a password on stdin, print the passwordHash for the config
@@ -30,12 +31,16 @@ def readLine : IO String := do
   return ((← (← IO.getStdin).getLine).dropEndWhile (· == '\n')).toString
 
 /-- Unlock from a password on stdin, as the CLI commands that touch content do. -/
+def loadUnlockKey (config : Config) : IO (Option ByteArray) := do
+  let some s ← config.unlockKey | return none
+  return some (← IO.ofExcept (Vault.parseUnlockKey s))
+
 def unlockFromStdin (config : Config) (db : Db.Conn) : IO Unit := do
   let password ← readLine
   let some stored := config.passwordHash | throw (IO.userError "no passwordHash configured")
   if !(← IO.ofExcept (Vault.PasswordHash.parse stored)).verify password then
     throw (IO.userError "wrong password")
-  Db.unlock db password
+  Db.unlock db password (← loadUnlockKey config)
 
 def startSources (config : Config) : IO Unit := do
   let stop ← IO.mkRef false
@@ -57,9 +62,20 @@ def serve (config : Config) : IO Unit := do
   Db.migrate db
   if config.passwordHash.isNone then
     log "main" "no passwordHash configured: the API will refuse every login"
+  let unlockKey ← loadUnlockKey config
+  let unlocked ← match unlockKey with
+    | none => pure false
+    | some k => match ← Db.unlockAtStart db k with
+      | .ok () => pure true
+      | .error why =>
+        log "main" s!"{why}; the first sign-in unlocks with the password"
+        pure false
   let ctx : AppContext := { config, db := ← Std.Mutex.new db, onUnlock := startSources config
-                            loginLock := ← Std.Mutex.new (), pending := ← IO.mkRef #[] }
-  log "main" s!"listening on http://{config.host}:{config.port}; locked until the first sign-in"
+                            loginLock := ← Std.Mutex.new (), pending := ← IO.mkRef #[]
+                            unlockKey }
+  if unlocked then startSources config
+  log "main" (s!"listening on http://{config.host}:{config.port}" ++
+    (if unlocked then "; unlocked by the unlock key" else "; locked until the first sign-in"))
   Async.block do
     let server ← Server.serve ctx
     server.waitShutdown
