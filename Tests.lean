@@ -237,6 +237,24 @@ def changeTests (s : Suite) : IO Unit := do
   for _ in [0:300] do bumpChanges (some #[4])
   s.eq "too far behind" (← changesSince now).2 none
 
+def oauthTests (s : Suite) : IO Unit := do
+  IO.println "oauth2"
+  s.eq "form encoding" (OAuth2.formEncode "a b/c+d~é") "a%20b%2Fc%2Bd~%C3%A9"
+  let err (r : Except String OAuth2.Grant) : Option String := match r with
+    | .error e => some e
+    | .ok _ => none
+  s.eq "grant" (OAuth2.parseResponse 200
+      "{\"token_type\":\"Bearer\",\"expires_in\":4049,\"access_token\":\"at\",\"refresh_token\":\"rt\"}").toOption
+    (some { accessToken := "at", refreshToken := some "rt", expiresIn := 4049 })
+  s.eq "grant without rotation" (OAuth2.parseResponse 200 "{\"access_token\":\"at\"}").toOption
+    (some { accessToken := "at", refreshToken := none, expiresIn := 3600 })
+  s.eq "error, first line of the description" (err (OAuth2.parseResponse 400
+      "{\"error\":\"invalid_grant\",\"error_description\":\"AADSTS70008: expired.\\r\\nTrace ID: x\"}"))
+    (some "invalid_grant: AADSTS70008: expired.")
+  s.eq "curl config quoting" (Http.configQuote "a\"b\\c\nd") "\"a\\\"b\\\\c\\nd\""
+  s.eq "curl config" (Http.configFor #[("Authorization", "Bearer t")] (some "x=1"))
+    "header = \"Authorization: Bearer t\"\ndata-binary = \"x=1\"\n"
+
 def main : IO UInt32 := do
   let s : Suite := { failures := ← IO.mkRef #[] }
   mimeTests s
@@ -247,6 +265,7 @@ def main : IO UInt32 := do
   cryptoTests s
   vaultTests s
   changeTests s
+  oauthTests s
   let failures ← s.failures.get
   if failures.isEmpty then
     IO.println "all tests passed"

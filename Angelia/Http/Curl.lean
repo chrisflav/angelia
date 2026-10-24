@@ -5,8 +5,9 @@ import Angelia.Util
 
 `Std.Http` is a server only and Lean has no TLS, so outbound requests go through the `curl`
 binary, as in taxis. Unlike there, connectors need response headers (`Last-Modified`,
-`X-Poll-Interval`), so they are captured too. Request headers are written to curl's stdin
-(`-H @-`) rather than its argument list, so tokens never show up in `ps`.
+`X-Poll-Interval`), so they are captured too. Request headers and the body are written to
+curl's stdin as a config file (`--config -`) rather than to its argument list, so tokens never
+show up in `ps`.
 -/
 
 namespace Angelia.Http
@@ -39,18 +40,28 @@ def parseHeadersAndBody (out : String) (fuel : Nat) : Array (String × String) �
   | head :: rest@(_ :: _), 0 => (parseHeaderBlock head, "\r\n\r\n".intercalate rest)
   | _, _ => (#[], out)
 
+/-- A string in curl's config syntax: double-quoted, with backslash escapes. -/
+def configQuote (s : String) : String :=
+  let esc (c : Char) : String := match c with
+    | '\\' => "\\\\" | '"' => "\\\"" | '\n' => "\\n" | '\r' => "\\r" | '\t' => "\\t"
+    | c => c.toString
+  "\"" ++ String.join (s.toList.map esc) ++ "\""
+
+/-- The config curl reads from stdin: one `header` line per header, and the body. -/
+def configFor (headers : Array (String × String)) (body : Option String) : String :=
+  String.join (headers.toList.map fun (k, v) => s!"header = {configQuote s!"{k}: {v}"}\n") ++
+    (body.map fun b => s!"data-binary = {configQuote b}\n").getD ""
+
 def request (method url : String) (headers : Array (String × String) := #[])
     (body : Option String := none) (timeoutSeconds : Nat := 60) : IO Response := do
-  let mut args := #["-sS", "-i", "--max-time", toString timeoutSeconds, "-X", method,
-    "-w", "\n%{http_code}", "-H", "@-"]
-  if let some b := body then args := args ++ #["--data-binary", b]
-  args := args.push url
+  let args := #["-sS", "-i", "--max-time", toString timeoutSeconds, "-X", method,
+    "-w", "\n%{http_code}", "--config", "-", url]
   let child ← IO.Process.spawn {
     cmd := "curl", args, stdin := .piped, stdout := .piped, stderr := .piped }
   -- The handle is closed when it is dropped at the end of this block, which ends curl's input.
   let child ← do
     let (stdin, child) ← child.takeStdin
-    stdin.putStr (String.join (headers.toList.map fun (k, v) => s!"{k}: {v}\n"))
+    stdin.putStr (configFor headers body)
     stdin.flush
     pure child
   let stderrTask ← IO.asTask child.stderr.readToEnd .dedicated

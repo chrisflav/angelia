@@ -1,6 +1,8 @@
 import Angelia.Ingest
 import Angelia.Imap.Client
 import Angelia.Mail.Mime
+import Angelia.OAuth2
+import Std.Sync.Mutex
 
 /-!
 # E-mail over IMAP
@@ -19,12 +21,15 @@ On first sync (or if the server reset `UIDVALIDITY`) only the newest `initialSyn
 imported. Messages are deduplicated on `Message-ID`, so a message filed in two watched folders, or
 re-numbered by a `UIDVALIDITY` reset, is stored once.
 
-Settings: `host`, `port` (993), `tls` (`implicit` | `starttls`), `username`, and either `password`
-/ `passwordCommand` or, for providers that only allow OAuth (Microsoft 365, Gmail without app
-passwords), `accessTokenCommand` — a helper such as `mutt_oauth2.py` or `oama` that prints a fresh
-access token; it is run on every connect, so it owns refreshing. Further: `folders` (`["INBOX"]`), `initialSync` (50), `maxBytes` (262144),
-`idleMinutes` (5), `pollSeconds` (120, without `IDLE`), `transport` (argv, overrides the TLS
-transport — for tests).
+Settings: `host`, `port` (993), `tls` (`implicit` | `starttls`), `username`, and either `password` /
+`passwordCommand` or, for providers that only allow OAuth (Microsoft 365, Gmail without app
+passwords), either `accessTokenCommand` — a helper such as `mutt_oauth2.py` or `oama` that prints a
+fresh access token; it is run on every connect, so it owns refreshing — or `oauth2` (`{"tokenUrl",
+"clientId", "scope"}`) with `refreshToken` / `refreshTokenCommand`, and angelia refreshes by itself:
+access tokens are cached until shortly before they expire, and a rotated refresh token is kept
+(encrypted) in the database, preferred over the configured one, which stays the fallback. Further:
+`folders` (`["INBOX"]`), `initialSync` (50), `maxBytes` (262144), `idleMinutes` (5), `pollSeconds`
+(120, without `IDLE`), `transport` (argv, overrides the TLS transport — for tests).
 -/
 
 open Lean Angelia.Imap
@@ -42,7 +47,33 @@ structure Settings where
   idleMinutes : Nat
   pollSeconds : Nat
 
-def Settings.load (j : Json) : IO Settings := do
+/-- Access tokens from a refresh token, renewed two minutes before they expire. The newest refresh
+    token is kept in the database; the configured one is tried when that fails, so provisioning a
+    fresh one after a revocation is just changing the configuration. -/
+def oauth2Credentials (source : String) (dbPath : System.FilePath) (j : Json) (username : String)
+    (client : OAuth2.Client) : IO (IO Conn.Credentials) := do
+  let cache ← Std.Mutex.new (none : Option (String × Int))
+  return cache.atomically do
+    let now ← nowSeconds
+    if let some (token, expires) ← get then
+      if now + 120 < expires then return .oauth2 username token
+    let db ← Db.connect dbPath
+    let stored ← Db.getSecret db source "oauth2RefreshToken"
+    let configured ← secret j "refreshToken"
+    let candidates := [stored, configured.filter (some · != stored)].filterMap id
+    if candidates.isEmpty then
+      throw (IO.userError "imap: 'oauth2' needs 'refreshToken' or 'refreshTokenCommand'")
+    let mut errors := #[]
+    for rt in candidates do
+      match ← client.refresh rt with
+      | .ok g =>
+        if let some next := g.refreshToken then Db.setSecret db source "oauth2RefreshToken" next
+        set (some (g.accessToken, now + g.expiresIn))
+        return .oauth2 username g.accessToken
+      | .error e => errors := errors.push e
+    throw (IO.userError s!"imap: token refresh failed: {"; ".intercalate errors.toList}")
+
+def Settings.load (source : String) (dbPath : System.FilePath) (j : Json) : IO Settings := do
   let get {α} [FromJson α] (k : String) (d : α) : α := (j.getObjValAs? α k).toOption.getD d
   let host : String := get "host" ""
   let port : Nat := get "port" (if get "tls" "implicit" == "starttls" then 143 else 993)
@@ -52,11 +83,14 @@ def Settings.load (j : Json) : IO Settings := do
       if host.isEmpty then throw (IO.userError "imap: 'host' is required")
       pure (if (get "tls" "implicit" : String) == "starttls" then .startTls host port else .implicitTls host port)
   let username : String := get "username" ""
-  let credentials : IO Conn.Credentials := do
-    if let some token ← secret j "accessToken" then return .oauth2 username token
-    let some password ← secret j "password"
-      | throw (IO.userError "imap: 'password', 'passwordCommand' or 'accessTokenCommand' is required")
-    return .password username password
+  let credentials : IO Conn.Credentials ← match j.getObjValAs? OAuth2.Client "oauth2" with
+    | .ok client => oauth2Credentials source dbPath j username client
+    | .error _ => pure do
+      if let some token ← secret j "accessToken" then return .oauth2 username token
+      let some password ← secret j "password"
+        | throw (IO.userError
+            "imap: 'password', 'passwordCommand', 'accessTokenCommand' or 'oauth2' is required")
+      return .password username password
   -- Fail at startup, not on the first connect, if the secret cannot be had at all.
   let _ ← credentials
   return {
@@ -183,7 +217,7 @@ partial def session (ctx : ConnectorCtx) (s : Settings) (folder : String) : IO U
     throw e
 
 def run (ctx : ConnectorCtx) : IO Unit := do
-  let s ← Settings.load ctx.source.settings
+  let s ← Settings.load ctx.name ctx.dbPath ctx.source.settings
   let workers ← s.folders.mapM fun folder => do
     let wctx ← ctx.fork
     IO.asTask (prio := .dedicated) (wctx.supervise (session wctx s folder))

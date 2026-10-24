@@ -117,6 +117,14 @@ def schemaSql : String := "
     scope TEXT NOT NULL DEFAULT '{}'
   );
 
+  -- Credentials a connector maintains itself, such as a rotated OAuth refresh token. Sealed.
+  CREATE TABLE IF NOT EXISTS secret (
+    source TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value BLOB NOT NULL,
+    PRIMARY KEY (source, key)
+  );
+
   -- The data key, wrapped under a key derived from the login password.
   CREATE TABLE IF NOT EXISTS keyring (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -529,6 +537,21 @@ def listHealth (db : Conn) : IO Json := do
     Json.mkObj [("source", source), ("kind", kind), ("state", state), ("detail", toJson detail),
       ("lastOk", toJson (lastOk.map Int64.toInt)), ("lastError", toJson lastError),
       ("lastErrorAt", toJson (lastErrorAt.map Int64.toInt)), ("events", events.toInt)])
+
+/-! ## Connector secrets -/
+
+private def secretAad (source key : String) : String := s!"secret\x00{source}\x00{key}"
+
+def getSecret (db : Conn) (source key : String) : IO (Option String) := do
+  let rows ← (← db query!"SELECT value FROM secret WHERE source = {source} AND key = {key}"
+    as ByteArray).toArray
+  let k ← Vault.keys
+  rows[0]?.mapM (Vault.open k (secretAad source key))
+
+def setSecret (db : Conn) (source key value : String) : IO Unit := do
+  let sealed ← Vault.seal (← Vault.keys) (secretAad source key) value
+  db exec!"INSERT INTO secret (source, key, value) VALUES ({source}, {key}, {sealed})
+    ON CONFLICT (source, key) DO UPDATE SET value = excluded.value"
 
 /-! ## Sessions -/
 
