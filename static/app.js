@@ -3,6 +3,13 @@
 // Everything shown here comes from other people (mail, GitHub, ...), so the DOM is only ever
 // built with `h()` — text goes in as text nodes, never through innerHTML.
 
+const prefs = {
+  get: (k, d) => { try { return localStorage.getItem("angelia." + k) ?? d; } catch (_) { return d; } },
+  set: (k, v) => { try { localStorage.setItem("angelia." + k, v); } catch (_) { /* private mode */ } },
+};
+document.documentElement.dataset.theme = prefs.get("theme", "system");
+document.documentElement.dataset.density = prefs.get("density", "comfortable");
+
 const state = {
   filter: { state: "inbox", source: null, label: null, q: "", thread: null },
   view: "list", // or "rules" | "sources"
@@ -189,7 +196,7 @@ function navItem(label, active, onclick, count, extra) {
 }
 
 function setFilter(f) {
-  state.view = "list";
+  showList();
   state.filter = { state: "inbox", source: null, label: null, q: state.filter.q, thread: null, ...f };
   $("search").value = state.filter.q;
   loadList(false).then(renderSidebar);
@@ -240,11 +247,7 @@ function renderSidebar() {
         before: h("span", { class: "dot " + st, title: st }),
       }));
   }
-  items.push(h("h2", {}, "Settings"));
-  items.push(navItem("Rules", state.view === "rules", showRules));
-  items.push(navItem("Source health", state.view === "sources", showSources));
-  items.push(navItem("API tokens", state.view === "tokens", () => showTokens()));
-  items.push(navItem("Sign-in security", state.view === "security", () => showSecurity()));
+  items.push(h("div", { class: "sidebar-end" }, navItem("Settings", false, () => showSettings())));
   fill($("sidebar"), ...items);
 }
 
@@ -258,15 +261,23 @@ async function newLabel() {
 
 /* ---------- list ---------- */
 
-/** The time for today, the date and time otherwise. */
+const clock = (d) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
+
+/** The time for today, the date and time otherwise; 24-hour. */
 function when(ts) {
   if (!ts) return "";
   const d = new Date(ts * 1000);
   const now = new Date();
-  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  if (d.toDateString() === now.toDateString()) return time;
+  if (d.toDateString() === now.toDateString()) return clock(d);
   return d.toLocaleDateString([], { day: "numeric", month: "short",
-    year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" }) + ", " + time;
+    year: d.getFullYear() === now.getFullYear() ? undefined : "numeric" }) + ", " + clock(d);
+}
+
+/** In full, for the message header: "Friday, 24 October 2026, 09:12". */
+function longTime(ts) {
+  const d = new Date(ts * 1000);
+  return d.toLocaleDateString([], { weekday: "long", day: "numeric", month: "long", year: "numeric" }) +
+    ", " + clock(d);
 }
 
 function labelChips(n) {
@@ -337,7 +348,7 @@ function renderList() {
 
 async function select(i) {
   state.selected = i;
-  state.view = "list";
+  showList();
   const n = state.items[i];
   if (!n) return;
   renderList();
@@ -364,26 +375,30 @@ function renderDetail() {
     renderList();
     loadMeta();
   };
+  const key = (k) => h("kbd", {}, k);
   fill($("detail"),
-    h("h1", {}, n.title),
-    h("div", { class: "meta" },
-      [n.author, n.source, n.kind, new Date(n.time * 1000).toLocaleString()]
-        .filter(Boolean).join(" · ")),
-    h("div", { class: "actions" },
-      h("button", { onclick: () => update([n.id], { archived: !n.archived }) },
-        n.archived ? "Unarchive" : "Archive", " ", h("kbd", {}, "e")),
-      h("button", { onclick: () => update([n.id], { starred: !n.starred }) },
-        n.starred ? "Unstar" : "Star", " ", h("kbd", {}, "s")),
-      h("button", { onclick: () => update([n.id], { read: !n.read }) },
-        n.read ? "Mark unread" : "Mark read", " ", h("kbd", {}, "u")),
-      n.threadKey ? h("button", { onclick: () => setFilter({ state: "all", thread: n.threadKey, source: n.source }) },
-        "Whole thread", " ", h("kbd", {}, "t")) : null,
-      n.url ? h("a", { href: n.url, target: "_blank", rel: "noopener noreferrer" }, "Open in source ↗") : null),
-    state.labels.length ? h("div", { class: "labels" }, state.labels.map((l) =>
-      h("label", {},
-        h("input", { type: "checkbox", checked: n.labels.includes(l.id),
-          onchange: (e) => toggleLabel(l, e.target.checked) }),
-        h("span", { class: "chip", style: { background: l.color } }, l.name)))) : null,
+    h("header", { class: "msg-header" },
+      h("h1", {}, n.title),
+      h("dl", {},
+        h("dt", {}, "From"), h("dd", {}, h("strong", {}, n.author || n.source)),
+        h("dt", {}, "Source"), h("dd", {}, n.source, n.kind && n.kind !== "mail" ? ` (${n.kind})` : null),
+        h("dt", {}, "Date"), h("dd", {}, h("time", { datetime: new Date(n.time * 1000).toISOString() }, longTime(n.time)))),
+      h("div", { class: "actions" },
+        h("button", { onclick: () => update([n.id], { archived: !n.archived }) },
+          n.archived ? "Move to inbox" : "Archive", key("e")),
+        h("button", { onclick: () => update([n.id], { starred: !n.starred }) },
+          n.starred ? "Unstar" : "Star", key("s")),
+        h("button", { onclick: () => update([n.id], { read: !n.read }) },
+          n.read ? "Mark unread" : "Mark read", key("u")),
+        n.threadKey && h("button", { onclick: () => setFilter({ state: "all", thread: n.threadKey, source: n.source }) },
+          "Conversation", key("t")),
+        n.url && h("a", { class: "button", href: n.url, target: "_blank", rel: "noopener noreferrer" },
+          n.kind === "mail" ? "Open original" : `Open on ${n.source}`)),
+      state.labels.length > 0 && h("div", { class: "labels", role: "group", "aria-label": "Labels" },
+        state.labels.map((l) => h("label", { class: "label-toggle" },
+          h("input", { type: "checkbox", checked: n.labels.includes(l.id),
+            onchange: (e) => toggleLabel(l, e.target.checked) }),
+          h("span", { class: "dot", style: { background: l.color } }), l.name)))),
     h("div", { class: "body" }, n.body.trim() ? renderMessage(n.body) : h("p", { class: "hint" }, "No text.")));
 }
 
@@ -568,283 +583,421 @@ function renderMessage(text) {
       signature.split("\n").map((l, k) => [k ? h("br") : null, inline(l)]))];
 }
 
-/* ---------- rules ---------- */
+/* ---------- settings ---------- */
 
-const FIELDS = ["source", "kind", "author", "title", "body", "thread", "url"];
-const OPS = ["contains", "equals", "startsWith", "endsWith"];
+// Settings is a page of its own, as in a mail client: it takes the place of the folders, the
+// list and the message, with its own sections on the left.
 
-function select_(options, value, onchange) {
-  return h("select", { onchange: (e) => onchange(e.target.value) },
-    options.map(([v, label]) => h("option", { value: v, selected: v === value }, label)));
+function showList() {
+  state.view = "list";
+  $("app").classList.remove("settings-open");
+  $("settings").hidden = true;
+}
+
+const SECTIONS = [
+  ["appearance", "Appearance"],
+  ["rules", "Rules"],
+  ["sources", "Sources"],
+  ["tokens", "API tokens"],
+  ["security", "Sign-in security"],
+];
+
+async function showSettings(section = prefs.get("settings", "appearance"), ...args) {
+  state.view = "settings";
+  prefs.set("settings", section);
+  $("app").classList.add("settings-open");
+  $("settings").hidden = false;
+  const content = await ({ appearance: appearancePage, rules: rulesPage, sources: sourcesPage,
+    tokens: tokensPage, security: securityPage })[section](...args);
+  fill($("settings"),
+    h("nav", { class: "settings-nav", "aria-label": "Settings" },
+      h("button", { class: "back", onclick: () => { showList(); renderSidebar(); } }, "Back to messages"),
+      SECTIONS.map(([key, label]) => h("button", { class: "nav-item" + (key === section ? " active" : ""),
+        "aria-current": key === section ? "page" : null, onclick: () => showSettings(key) }, label))),
+    h("div", { class: "settings-page" }, content));
+  $("settings").scrollTop = 0;
+}
+
+/** A labelled control in a settings form. */
+function row(label, control, hint) {
+  const id = "f" + Math.random().toString(36).slice(2, 8);
+  if (control instanceof HTMLElement && control.matches("input, select")) control.id = id;
+  return h("div", { class: "form-row" },
+    h("label", { class: "form-label", for: control instanceof HTMLElement && control.id ? id : null }, label),
+    h("div", { class: "form-field" }, control, hint && h("p", { class: "hint" }, hint)));
+}
+
+/** A modal step, closed with Escape or Cancel. Resolves when it closes. */
+function openDialog(title, build) {
+  const dlg = h("dialog", { class: "dialog" });
+  const close = () => dlg.close();
+  fill(dlg, h("h2", {}, title), build(close));
+  document.body.append(dlg);
+  dlg.addEventListener("close", () => dlg.remove());
+  dlg.showModal();
+  dlg.querySelector("input")?.focus();
+  return dlg;
+}
+
+/* Appearance */
+
+const THEMES = [
+  ["system", "System", "Light or dark, following this computer"],
+  ["light", "Light", ""],
+  ["dark", "Dark", ""],
+  ["solarized-light", "Solarized light", ""],
+  ["solarized-dark", "Solarized dark", ""],
+];
+
+function appearancePage() {
+  const current = prefs.get("theme", "system");
+  const density = prefs.get("density", "comfortable");
+  const choose = (theme) => {
+    prefs.set("theme", theme);
+    document.documentElement.dataset.theme = theme;
+  };
+  return [
+    h("h1", {}, "Appearance"),
+    h("p", { class: "hint" }, "Saved in this browser only."),
+    h("section", {}, h("h2", {}, "Theme"),
+      h("div", { class: "themes", role: "radiogroup" }, THEMES.map(([key, label, note]) =>
+        h("label", { class: "theme-choice" },
+          h("input", { type: "radio", name: "theme", value: key, checked: key === current,
+            onchange: () => choose(key) }),
+          h("span", { class: "swatch", "data-swatch": key },
+            h("span", { class: "sw-pane" }), h("span", { class: "sw-list" }), h("span", { class: "sw-accent" })),
+          h("span", {}, label, note && h("span", { class: "hint" }, note)))))),
+    h("section", {}, h("h2", {}, "Density"),
+      h("div", { class: "choices" }, [["comfortable", "Comfortable"], ["compact", "Compact"]].map(([key, label]) =>
+        h("label", {}, h("input", { type: "radio", name: "density", checked: key === density, onchange: () => {
+          prefs.set("density", key);
+          document.documentElement.dataset.density = key;
+        } }), label)))),
+  ];
+}
+
+/* Rules */
+
+const FIELDS = [["title", "Subject"], ["body", "Text"], ["author", "Sender"], ["source", "Source"],
+  ["kind", "Kind"], ["thread", "Conversation"], ["url", "Link"]];
+const OPS = [["contains", "contains"], ["equals", "is"], ["startsWith", "begins with"], ["endsWith", "ends with"]];
+const NOT_OPS = { contains: "does not contain", equals: "is not", startsWith: "does not begin with",
+  endsWith: "does not end with" };
+
+function select_(options, value, onchange, label) {
+  return h("select", { onchange: (e) => onchange(e.target.value), "aria-label": label },
+    options.map(([v, text]) => h("option", { value: v, selected: v === value }, text)));
+}
+
+function describeRule(r) {
+  const byId = Object.fromEntries(state.labels.map((l) => [l.id, l.name]));
+  const conds = r.spec.conditions.map((c) =>
+    `${(FIELDS.find(([f]) => f === c.field)?.[1] || c.field).toLowerCase()} ${
+      c.negate ? NOT_OPS[c.op] : OPS.find(([o]) => o === c.op)?.[1]} "${c.value}"`);
+  const actions = [...r.spec.labels.map((id) => `label ${byId[id] || "?"}`),
+    r.spec.archive && "archive", r.spec.markRead && "mark read"].filter(Boolean);
+  return `If ${conds.join(r.spec.match === "any" ? " or " : " and ") || "always"}: ${actions.join(", ") || "nothing"}.`;
 }
 
 function ruleEditor(rule, onSave, onCancel) {
   const spec = structuredClone(rule.spec);
   let name = rule.name;
-  const root = h("div", { class: "rule" });
-  const draw = () => {
-    fill(root,
-      h("div", { class: "row" },
-        h("input", { value: name, placeholder: "Rule name", oninput: (e) => { name = e.target.value; } }),
-        "match", select_([["all", "all conditions"], ["any", "any condition"]], spec.match,
-          (v) => { spec.match = v; })),
-      spec.conditions.map((c, i) => h("div", { class: "cond" },
-        select_(FIELDS.map((f) => [f, f]), c.field, (v) => { c.field = v; }),
-        select_([["false", "is"], ["true", "is not"]], String(c.negate), (v) => { c.negate = v === "true"; }),
-        select_(OPS.map((o) => [o, o]), c.op, (v) => { c.op = v; }),
-        h("input", { value: c.value, oninput: (e) => { c.value = e.target.value; } }),
-        h("button", { onclick: () => { spec.conditions.splice(i, 1); draw(); } }, "−"))),
-      h("div", { class: "row" }, h("button", { onclick: () => {
-        spec.conditions.push({ field: "title", op: "contains", value: "", negate: false }); draw();
-      } }, "+ condition")),
-      h("div", { class: "row" }, "then label:",
-        state.labels.map((l) => h("label", {},
-          h("input", { type: "checkbox", checked: spec.labels.includes(l.id), onchange: (e) => {
-            spec.labels = e.target.checked ? [...spec.labels, l.id] : spec.labels.filter((x) => x !== l.id);
-          } }), " ", l.name)),
-        state.labels.length ? null : h("span", { class: "hint" }, "(create labels in the sidebar first)")),
-      h("div", { class: "row" },
-        h("label", {}, h("input", { type: "checkbox", checked: spec.archive,
-          onchange: (e) => { spec.archive = e.target.checked; } }), " archive"),
-        h("label", {}, h("input", { type: "checkbox", checked: spec.markRead,
-          onchange: (e) => { spec.markRead = e.target.checked; } }), " mark read")),
-      h("div", { class: "row" },
-        h("button", { class: "primary", onclick: () => onSave(name, spec) }, "Save"),
-        onCancel ? h("button", { onclick: onCancel }, "Cancel") : null));
-  };
+  const root = h("div", { class: "editor" });
+  const error = h("p", { class: "error", role: "alert" });
+  const draw = () => fill(root,
+    row("Name", h("input", { value: name, placeholder: "e.g. Seminar mail", oninput: (e) => { name = e.target.value; } })),
+    row("Applies if", select_([["all", "all of these match"], ["any", "any of these matches"]], spec.match,
+      (v) => { spec.match = v; }, "Match")),
+    h("div", { class: "conditions" }, spec.conditions.map((c, i) => h("div", { class: "cond" },
+      select_(FIELDS, c.field, (v) => { c.field = v; }, "Field"),
+      select_(OPS.map(([o, t]) => [o, t]).concat(OPS.map(([o]) => ["not:" + o, NOT_OPS[o]])),
+        (c.negate ? "not:" : "") + c.op, (v) => { c.negate = v.startsWith("not:"); c.op = v.replace("not:", ""); }, "Comparison"),
+      h("input", { value: c.value, "aria-label": "Value", oninput: (e) => { c.value = e.target.value; } }),
+      h("button", { class: "quiet", onclick: () => { spec.conditions.splice(i, 1); draw(); } }, "Remove"))),
+      h("button", { onclick: () => { spec.conditions.push({ field: "title", op: "contains", value: "", negate: false }); draw(); } },
+        "Add condition")),
+    row("Then", h("div", { class: "choices" },
+      state.labels.map((l) => h("label", {},
+        h("input", { type: "checkbox", checked: spec.labels.includes(l.id), onchange: (e) => {
+          spec.labels = e.target.checked ? [...spec.labels, l.id] : spec.labels.filter((x) => x !== l.id);
+        } }), h("span", { class: "dot", style: { background: l.color } }), `label ${l.name}`)),
+      h("label", {}, h("input", { type: "checkbox", checked: spec.archive,
+        onchange: (e) => { spec.archive = e.target.checked; } }), "archive"),
+      h("label", {}, h("input", { type: "checkbox", checked: spec.markRead,
+        onchange: (e) => { spec.markRead = e.target.checked; } }), "mark read"))),
+    h("div", { class: "buttons" },
+      h("button", { class: "primary", onclick: async () => {
+        try { await onSave(name.trim(), spec); } catch (err) { error.textContent = err.message; }
+      } }, "Save rule"),
+      h("button", { onclick: onCancel }, "Cancel"), error));
   draw();
   return root;
 }
 
-async function showRules() {
-  state.view = "rules";
-  renderSidebar();
+async function rulesPage(editing) {
   const rules = await api("GET", "rules");
-  const byId = Object.fromEntries(state.labels.map((l) => [l.id, l]));
-  const pane = $("detail");
-  const describe = (r) => h("div", { class: "rule" },
-    h("div", { class: "row" },
-      h("strong", {}, r.name || "(unnamed)"),
-      h("label", {}, h("input", { type: "checkbox", checked: r.enabled, onchange: async (e) => {
-        await api("PATCH", "rules/" + r.id, { enabled: e.target.checked });
-      } }), " enabled"),
-      h("button", { onclick: () => fill(pane, ruleEditor(r, async (name, spec) => {
-        await api("PATCH", "rules/" + r.id, { name, spec });
-        showRules();
-      }, showRules)) }, "Edit"),
-      h("button", { onclick: async () => {
-        if (!confirm("Delete this rule?")) return;
-        await api("DELETE", "rules/" + r.id);
-        showRules();
-      } }, "Delete")),
-    h("div", { class: "hint" },
-      `if ${r.spec.match} of: `,
-      r.spec.conditions.map((c) => `${c.field} ${c.negate ? "not " : ""}${c.op} "${c.value}"`).join("; "),
-      " → ",
-      [...r.spec.labels.map((id) => byId[id]?.name || "?"),
-        r.spec.archive ? "archive" : null, r.spec.markRead ? "mark read" : null]
-        .filter(Boolean).join(", ")));
-  fill(pane,
+  const blank = { name: "", spec: { match: "all", labels: [], archive: false, markRead: false,
+    conditions: [{ field: "title", op: "contains", value: "", negate: false }] } };
+  const back = () => showSettings("rules");
+  return [
     h("h1", {}, "Rules"),
-    h("p", { class: "hint" }, "Rules run on every new notification. Labels are organisation, not sources: ",
-      "a rule can put mail and GitHub notifications under the same label. ",
-      "Re-running applies the current label rules to all past notifications."),
-    h("div", { class: "actions" },
-      h("button", { class: "primary", onclick: () => fill(pane, ruleEditor(
-        { name: "", spec: { match: "all", conditions: [{ field: "title", op: "contains", value: "", negate: false }],
-          labels: [], archive: false, markRead: false } },
-        async (name, spec) => { await api("POST", "rules", { name, spec }); showRules(); }, showRules)) },
-        "New rule"),
-      h("button", { onclick: async (e) => {
-        const r = await api("POST", "rules/rerun");
-        e.target.textContent = `Re-ran: ${r.matched} matched`;
-        refresh();
-      } }, "Re-run over history")),
-    ...rules.map(describe));
+    h("p", { class: "hint" }, "Rules run on each new notification, in this order."),
+    editing === "new"
+      ? ruleEditor(blank, async (name, spec) => { await api("POST", "rules", { name, spec }); back(); }, back)
+      : h("div", { class: "buttons" },
+        h("button", { class: "primary", onclick: () => showSettings("rules", "new") }, "New rule"),
+        h("button", { onclick: async (e) => {
+          e.target.disabled = true;
+          const r = await api("POST", "rules/rerun");
+          e.target.textContent = `Applied to past notifications: ${r.matched} matched`;
+          refresh();
+        } }, "Apply to past notifications")),
+    rules.length ? h("ul", { class: "rows" }, rules.map((r) => editing === r.id
+      ? h("li", {}, ruleEditor(r, async (name, spec) => { await api("PATCH", "rules/" + r.id, { name, spec }); back(); }, back))
+      : h("li", { class: r.enabled ? null : "off" },
+        h("div", { class: "row-main" }, h("strong", {}, r.name || "Unnamed rule"), h("p", { class: "hint" }, describeRule(r))),
+        h("div", { class: "buttons" },
+          h("label", {}, h("input", { type: "checkbox", checked: r.enabled, onchange: async (e) => {
+            await api("PATCH", "rules/" + r.id, { enabled: e.target.checked });
+            back();
+          } }), "On"),
+          h("button", { onclick: () => showSettings("rules", r.id) }, "Edit"),
+          h("button", { class: "danger", onclick: async () => {
+            if (!confirm(`Delete the rule "${r.name || "Unnamed rule"}"?`)) return;
+            await api("DELETE", "rules/" + r.id);
+            back();
+          } }, "Delete")))))
+      : h("p", { class: "empty" }, "No rules yet."),
+  ];
 }
 
-/* ---------- sources ---------- */
+/* Sources */
 
-async function showSources() {
-  state.view = "sources";
+function ago(t) {
+  if (!t) return "never";
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  if (s < 90) return `${s} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  return when(t);
+}
+
+async function sourcesPage() {
   await loadMeta();
-  const ago = (t) => t ? `${Math.max(0, Math.round(Date.now() / 1000 - t))} s ago` : "never";
-  fill($("detail"),
-    h("h1", {}, "Source health"),
-    h("p", { class: "hint" }, "A source that is quiet and has not synced recently is broken, not idle."),
-    h("table", {},
-      h("tr", {}, ["Source", "Kind", "State", "Detail", "Last OK", "Last error", "Events"].map((t) => h("th", {}, t))),
-      state.sources.health.map((s) => h("tr", {},
-        h("td", {}, s.source), h("td", {}, s.kind),
-        h("td", {}, h("span", { class: "dot " + s.state, style: { display: "inline-block" } }), " ", s.state),
-        h("td", {}, s.detail || ""), h("td", {}, ago(s.lastOk)),
-        h("td", {}, s.lastError ? `${s.lastError} (${ago(s.lastErrorAt)})` : ""),
-        h("td", {}, s.events)))));
+  return [
+    h("h1", {}, "Sources"),
+    h("p", { class: "hint" }, "A source that has not synced for a while is broken, not quiet."),
+    h("table", { class: "table" },
+      h("thead", {}, h("tr", {}, ["Source", "State", "Last synced", "Notifications"].map((t) => h("th", {}, t)))),
+      h("tbody", {}, state.sources.health.map((s) => h("tr", {},
+        h("td", {}, h("strong", {}, s.source), h("div", { class: "hint" }, s.kind)),
+        h("td", {}, h("span", { class: "status" }, h("span", { class: "dot " + s.state }), s.state),
+          s.detail && h("div", { class: "hint" }, s.detail),
+          s.lastError && h("div", { class: "error" }, `Last error ${ago(s.lastErrorAt)}: ${s.lastError}`)),
+        h("td", {}, ago(s.lastOk)),
+        h("td", { class: "num" }, s.events))))),
+  ];
 }
 
-/* ---------- API tokens ---------- */
+/* API tokens */
 
-/** Checkboxes for a subset of `options` ([value, label] pairs); unticking "all" restricts. */
-function subsetPicker(title, options, picked) {
-  const all = h("input", { type: "checkbox", checked: true });
-  const boxes = options.map(([v, label]) => [v, h("input", { type: "checkbox", disabled: true })]);
-  all.addEventListener("change", () => boxes.forEach(([, b]) => { b.disabled = all.checked; }));
+function subsetPicker(name, options, picked) {
+  const all = h("input", { type: "radio", name, checked: true });
+  const some = h("input", { type: "radio", name });
+  const boxes = options.map(([v, label]) => [v, h("input", { type: "checkbox" }), label]);
+  const list = h("div", { class: "choices sub", hidden: true }, boxes.map(([, b, label]) => h("label", {}, b, label)));
+  const sync = () => { list.hidden = all.checked; };
+  all.addEventListener("change", sync);
+  some.addEventListener("change", sync);
   picked.get = () => all.checked ? null : boxes.filter(([, b]) => b.checked).map(([v]) => v);
-  return h("div", { class: "row" }, h("strong", {}, title),
-    h("label", {}, all, " all"),
-    boxes.map(([v, b], i) => h("label", {}, b, " ", options[i][1])));
+  return h("div", {}, h("div", { class: "choices" }, h("label", {}, all, "All"), h("label", {}, some, "Only these")), list);
 }
 
 function describeScope(scope) {
   const byId = Object.fromEntries(state.labels.map((l) => [l.id, l.name]));
-  const parts = [
-    scope.sources ? "sources: " + (scope.sources.join(", ") || "none") : "all sources",
-    scope.labels ? "labels: " + (scope.labels.map((id) => byId[id] || "#" + id).join(", ") || "none") : "all labels",
-    scope.write ? "read + write" : "read-only",
-  ];
-  return parts.join(" · ");
+  const sources = scope.sources ? scope.sources.join(", ") || "no sources" : "all sources";
+  const labels = scope.labels ? "labelled " + (scope.labels.map((id) => byId[id] || "#" + id).join(" or ") || "nothing") : "";
+  return [`Sees ${sources}${labels ? ", " + labels : ""}.`, scope.write ? "May mark read, archive, star and label." : "Read-only."];
 }
 
-async function showTokens(created) {
-  state.view = "tokens";
-  renderSidebar();
+async function tokensPage(created) {
   const tokens = await api("GET", "tokens");
-  const date = (t) => t ? new Date(t * 1000).toLocaleString() : "never";
-  const name = h("input", { placeholder: "Token name, e.g. laptop CLI" });
-  const sources = {}, labels = {};
-  const write = h("input", { type: "checkbox" });
-  const error = h("span", { class: "error" });
-  const create = async () => {
-    if (!name.value.trim()) { name.focus(); return; }
-    try {
-      showTokens(await api("POST", "tokens", { name: name.value.trim(),
-        scope: { sources: sources.get(), labels: labels.get(), write: write.checked } }));
-    } catch (err) { error.textContent = err.message; }
-  };
-  name.addEventListener("keydown", (e) => { if (e.key === "Enter") create(); });
-  fill($("detail"),
+  const newToken = () => openDialog("New API token", (close) => {
+    const name = h("input", { placeholder: "e.g. phone" });
+    const sources = {}, labels = {};
+    const write = h("input", { type: "checkbox" });
+    const error = h("p", { class: "error", role: "alert" });
+    const create = async () => {
+      if (!name.value.trim()) { error.textContent = "Give the token a name."; return; }
+      try {
+        const t = await api("POST", "tokens", { name: name.value.trim(),
+          scope: { sources: sources.get(), labels: labels.get(), write: write.checked } });
+        close();
+        showSettings("tokens", t);
+      } catch (err) { error.textContent = err.message; }
+    };
+    return [
+      row("Name", name),
+      row("Sources", subsetPicker("t-sources", state.sources.configured.map((x) => [x.name, x.name]), sources)),
+      row("Labels", subsetPicker("t-labels", state.labels.map((l) => [l.id, l.name]), labels)),
+      row("Changes", h("label", { class: "check" }, write, "May mark read, archive, star and label")),
+      error,
+      h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),
+        h("button", { class: "primary", onclick: create }, "Create token")),
+    ];
+  });
+  return [
     h("h1", {}, "API tokens"),
-    h("p", { class: "hint" }, "Tokens let clients other than this browser use the API, sent as ",
-      h("code", {}, "Authorization: Bearer agl_…"), ". A token only ever sees notifications from its ",
-      "sources that carry one of its labels, and can change them only if it may write. ",
-      "Labels, rules, views and tokens can only be managed from a logged-in session."),
-    ...(created ? [h("div", { class: "rule" },
-      h("strong", {}, `Token "${created.name}" created. Copy it now; it will not be shown again.`),
-      h("div", { class: "hint" }, describeScope(created.scope)),
-      h("div", { class: "row" },
-        h("input", { class: "token", value: created.token, readonly: true, onfocus: (e) => e.target.select() }),
+    h("p", { class: "hint" }, "Other programs sign in with a token, sent as ", h("code", {}, "Authorization: Bearer agl_…"),
+      ". A token sees only notifications from its sources that carry one of its labels."),
+    created && h("div", { class: "callout", role: "status" },
+      h("strong", {}, `Token "${created.name}" created. Copy it now: it is not shown again.`),
+      h("div", { class: "buttons" },
+        h("input", { class: "mono", value: created.token, readonly: true, onfocus: (e) => e.target.select() }),
         h("button", { onclick: async (e) => {
           await navigator.clipboard.writeText(created.token);
           e.target.textContent = "Copied";
-        } }, "Copy")))] : []),
-    h("div", { class: "rule" },
-      h("div", { class: "row" }, name),
-      subsetPicker("Sources", state.sources.configured.map((x) => [x.name, x.name]), sources),
-      subsetPicker("Labels", state.labels.map((l) => [l.id, l.name]), labels),
-      h("div", { class: "row" }, h("label", {}, write, " may mark read, archive, star and label")),
-      h("div", { class: "row" }, h("button", { class: "primary", onclick: create }, "Create token"), error)),
-    tokens.length ? h("table", {},
-      h("tr", {}, ["Name", "Scope", "Created", "Last used", ""].map((t) => h("th", {}, t))),
-      tokens.map((t) => h("tr", {},
-        h("td", {}, t.name), h("td", {}, t.scope ? describeScope(t.scope) : "?"),
-        h("td", {}, date(t.createdAt)), h("td", {}, date(t.lastUsed)),
-        h("td", {}, h("button", { onclick: async () => {
-          if (!confirm(`Revoke token "${t.name}"? Clients using it stop working immediately.`)) return;
-          await api("DELETE", "tokens/" + t.id);
-          showTokens();
-        } }, "Revoke")))))
-      : h("p", { class: "hint" }, "No tokens yet."));
+        } }, "Copy"))),
+    h("div", { class: "buttons" }, h("button", { class: "primary", onclick: newToken }, "New token")),
+    tokens.length ? h("ul", { class: "rows" }, tokens.map((t) => h("li", {},
+      h("div", { class: "row-main" }, h("strong", {}, t.name),
+        t.scope && describeScope(t.scope).map((line) => h("p", { class: "hint" }, line)),
+        h("p", { class: "hint" }, `Created ${when(t.createdAt)} · last used ${ago(t.lastUsed)}`)),
+      h("div", { class: "buttons" }, h("button", { class: "danger", onclick: async () => {
+        if (!confirm(`Revoke "${t.name}"? Programs using it stop working at once.`)) return;
+        await api("DELETE", "tokens/" + t.id);
+        showSettings("tokens");
+      } }, "Revoke")))))
+      : h("p", { class: "empty" }, "No tokens yet."),
+  ];
 }
 
-/* ---------- sign-in security ---------- */
+/* Sign-in security */
 
-async function showSecurity(notice) {
-  state.view = "security";
-  renderSidebar();
+/** The password, asked for in the dialog of the change it confirms. */
+const passwordField = () => h("input", { type: "password", autocomplete: "current-password" });
+
+function addKeyDialog() {
+  openDialog("Add a security key", (close) => {
+    const name = h("input", { placeholder: "e.g. Titan" });
+    const password = passwordField();
+    const status = h("p", { class: "hint", role: "status" });
+    const error = h("p", { class: "error", role: "alert" });
+    const go = h("button", { class: "primary", onclick: async () => {
+      error.textContent = "";
+      if (!password.value) { error.textContent = "Enter your password."; return; }
+      go.disabled = true;
+      try {
+        const o = await api("POST", "second-factors/webauthn/challenge");
+        status.textContent = "Insert the key and tap it now.";
+        const cred = await navigator.credentials.create({ publicKey: {
+          challenge: fromB64(o.challenge), rp: o.rp,
+          user: { id: fromB64(o.user.id), name: o.user.name, displayName: o.user.displayName },
+          pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+          excludeCredentials: o.excludeCredentials.map((id) => ({ type: "public-key", id: fromB64(id) })),
+          authenticatorSelection: { residentKey: "discouraged", userVerification: "discouraged" },
+          attestation: "none", timeout: 60000 } });
+        await api("POST", "second-factors/webauthn", { password: password.value,
+          name: name.value.trim() || "Security key",
+          clientDataJSON: toB64(cred.response.clientDataJSON),
+          authenticatorData: toB64(cred.response.getAuthenticatorData()),
+          publicKey: toB64(cred.response.getPublicKey()), alg: cred.response.getPublicKeyAlgorithm() });
+        close();
+        showSettings("security", "Security key added.");
+      } catch (err) {
+        status.textContent = "";
+        error.textContent = err.name === "NotAllowedError" ? "No key was tapped. Try again." : err.message;
+        go.disabled = false;
+      }
+    } }, "Add and tap the key");
+    return [row("Name", name), row("Password", password, "Needed for every change here."), status, error,
+      h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"), go)];
+  });
+}
+
+function addAppDialog() {
+  openDialog("Add an authenticator app", (close) => {
+    const name = h("input", { placeholder: "e.g. phone" });
+    const password = passwordField();
+    const error = h("p", { class: "error", role: "alert" });
+    const body = h("div");
+    const step1 = () => fill(body,
+      row("Name", name), row("Password", password, "Needed for every change here."), error,
+      h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),
+        h("button", { class: "primary", onclick: async () => {
+          if (!password.value) { error.textContent = "Enter your password."; return; }
+          try { step2(await api("POST", "second-factors/totp/secret")); } catch (err) { error.textContent = err.message; }
+        } }, "Continue")));
+    const step2 = (o) => {
+      const qr = qrcode(0, "M");
+      qr.addData(o.uri);
+      qr.make();
+      const code = h("input", { placeholder: "123456", inputmode: "numeric", autocomplete: "one-time-code" });
+      const add = async () => {
+        try {
+          await api("POST", "second-factors/totp", { password: password.value,
+            name: name.value.trim() || "Authenticator app", code: code.value });
+          close();
+          showSettings("security", "Authenticator app added.");
+        } catch (err) { error.textContent = err.message; }
+      };
+      code.addEventListener("keydown", (e) => { if (e.key === "Enter") add(); });
+      fill(body,
+        h("p", {}, "Scan the code with the app, then enter the six digits it shows."),
+        h("img", { class: "qr", src: qr.createDataURL(5, 2), alt: "QR code for the authenticator app" }),
+        h("p", { class: "hint" }, "Or type this key into the app: ", h("code", {}, o.secret)),
+        row("Code", code), error,
+        h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),
+          h("button", { class: "primary", onclick: add }, "Add app")));
+      code.focus();
+    };
+    step1();
+    return body;
+  });
+}
+
+function removeFactorDialog(f) {
+  openDialog(`Remove "${f.name}"`, (close) => {
+    const password = passwordField();
+    const error = h("p", { class: "error", role: "alert" });
+    return [h("p", {}, "It can no longer be used to sign in."), row("Password", password), error,
+      h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),
+        h("button", { class: "danger", onclick: async () => {
+          try {
+            await api("DELETE", "second-factors/" + f.id, { password: password.value });
+            close();
+            showSettings("security", `Removed "${f.name}".`);
+          } catch (err) { error.textContent = err.message; }
+        } }, "Remove"))];
+  });
+}
+
+async function securityPage(notice) {
   const factors = await api("GET", "second-factors");
-  const date = (t) => t ? new Date(t * 1000).toLocaleString() : "never";
-  const password = h("input", { type: "password", placeholder: "Your password", autocomplete: "current-password" });
-  const error = h("span", { class: "error" });
-  const needPassword = () => {
-    if (password.value) return true;
-    error.textContent = "Enter your password first.";
-    password.focus();
-    return false;
-  };
-  const run = (act) => async () => {
-    error.textContent = "";
-    if (!needPassword()) return;
-    try { await act(); } catch (err) {
-      error.textContent = err.name === "NotAllowedError" ? "No key was tapped." : err.message;
-    }
-  };
-
-  const keyName = h("input", { placeholder: "Name, e.g. Titan" });
-  const addKey = run(async () => {
-    const o = await api("POST", "second-factors/webauthn/challenge");
-    const cred = await navigator.credentials.create({ publicKey: {
-      challenge: fromB64(o.challenge), rp: o.rp,
-      user: { id: fromB64(o.user.id), name: o.user.name, displayName: o.user.displayName },
-      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
-      excludeCredentials: o.excludeCredentials.map((id) => ({ type: "public-key", id: fromB64(id) })),
-      authenticatorSelection: { residentKey: "discouraged", userVerification: "discouraged" },
-      attestation: "none", timeout: 60000 } });
-    await api("POST", "second-factors/webauthn", { password: password.value,
-      name: keyName.value.trim() || "Security key",
-      clientDataJSON: toB64(cred.response.clientDataJSON),
-      authenticatorData: toB64(cred.response.getAuthenticatorData()),
-      publicKey: toB64(cred.response.getPublicKey()), alg: cred.response.getPublicKeyAlgorithm() });
-    showSecurity("Security key added.");
-  });
-
-  const appName = h("input", { placeholder: "Name, e.g. phone" });
-  const appSetup = h("div");
-  const addApp = run(async () => {
-    const o = await api("POST", "second-factors/totp/secret");
-    const qr = qrcode(0, "M");
-    qr.addData(o.uri);
-    qr.make();
-    const code = h("input", { placeholder: "6-digit code", inputmode: "numeric" });
-    const confirmApp = run(async () => {
-      await api("POST", "second-factors/totp", { password: password.value,
-        name: appName.value.trim() || "Authenticator app", code: code.value });
-      showSecurity("Authenticator app added.");
-    });
-    code.addEventListener("keydown", (e) => { if (e.key === "Enter") confirmApp(); });
-    fill(appSetup,
-      h("p", { class: "hint" }, "Scan this with the app, then enter the code it shows."),
-      h("img", { src: qr.createDataURL(5, 4), alt: "QR code for the authenticator app" }),
-      h("p", { class: "hint" }, "Or enter the key by hand: ", h("code", {}, o.secret)),
-      h("div", { class: "row" }, code, h("button", { class: "primary", onclick: confirmApp }, "Confirm")));
-    code.focus();
-  });
-
-  const kinds = { webauthn: "security key", totp: "authenticator app" };
-  fill($("detail"),
+  const kinds = { webauthn: "Security key", totp: "Authenticator app" };
+  const on = factors.length > 0;
+  return [
     h("h1", {}, "Sign-in security"),
-    h("p", { class: "hint" }, "With a security key or an authenticator app registered, signing in takes ",
-      "the password and then a tap on the key or a code from the app. Register two, so that losing ",
-      "one does not lock you out. API tokens are not affected."),
-    notice ? h("div", { class: "rule" }, h("strong", {}, notice)) : null,
-    h("div", { class: "row" }, password, error),
-    h("div", { class: "rule" },
-      h("strong", {}, "Add a security key"),
-      h("div", { class: "row" }, keyName, h("button", { class: "primary", onclick: addKey }, "Add and tap"))),
-    h("div", { class: "rule" },
-      h("strong", {}, "Add an authenticator app"),
-      h("div", { class: "row" }, appName, h("button", { class: "primary", onclick: addApp }, "Set up")),
-      appSetup),
-    factors.length ? h("table", {},
-      h("tr", {}, ["Name", "Kind", "Added", "Last used", ""].map((t) => h("th", {}, t))),
-      factors.map((f) => h("tr", {},
-        h("td", {}, f.name), h("td", {}, kinds[f.kind] || f.kind),
-        h("td", {}, date(f.createdAt)), h("td", {}, date(f.lastUsed)),
-        h("td", {}, h("button", { onclick: run(async () => {
-          if (!confirm(`Remove "${f.name}"?`)) return;
-          await api("DELETE", "second-factors/" + f.id, { password: password.value });
-          showSecurity(`Removed "${f.name}".`);
-        }) }, "Remove")))))
-      : h("p", { class: "hint" }, "None yet: signing in takes the password alone."));
+    notice && h("p", { class: "notice", role: "status" }, notice),
+    h("section", {},
+      h("h2", {}, "Two-step sign-in"),
+      h("div", { class: "status-line " + (on ? "on" : "off") },
+        h("strong", {}, on ? "On" : "Off"),
+        h("span", {}, on
+          ? `Signing in takes the password and one of these ${factors.length === 1 ? "method" : `${factors.length} methods`}.`
+          : "Signing in takes the password alone.")),
+      on && factors.length === 1 && h("p", { class: "hint" }, "Add a second method, so that losing one does not lock you out."),
+      on && h("ul", { class: "rows" }, factors.map((f) => h("li", {},
+        h("div", { class: "row-main" }, h("strong", {}, f.name),
+          h("p", { class: "hint" }, `${kinds[f.kind] || f.kind} · added ${when(f.createdAt)} · last used ${ago(f.lastUsed)}`)),
+        h("div", { class: "buttons" }, h("button", { onclick: () => removeFactorDialog(f) }, "Remove"))))),
+      h("div", { class: "buttons" },
+        h("button", { class: on ? null : "primary", onclick: addKeyDialog }, "Add a security key"),
+        h("button", { onclick: addAppDialog }, "Add an authenticator app"))),
+    h("section", {},
+      h("h2", {}, "API tokens"),
+      h("p", { class: "hint" }, "Tokens sign in without a second step; each sees only what its scope allows. ",
+        h("a", { href: "#", onclick: (e) => { e.preventDefault(); showSettings("tokens"); } }, "Manage tokens"))),
+  ];
 }
 
 /* ---------- keyboard, search, live updates ---------- */
@@ -862,6 +1015,7 @@ document.addEventListener("keydown", (e) => {
     if (e.key === "Escape") e.target.blur();
     return;
   }
+  if (e.ctrlKey || e.metaKey || e.altKey || state.view !== "list" || document.querySelector("dialog[open]")) return;
   const n = state.items[state.selected];
   switch (e.key) {
     case "j": move(1); break;
@@ -885,7 +1039,7 @@ $("search").addEventListener("input", (e) => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => {
     state.filter.q = e.target.value.trim();
-    state.view = "list";
+    showList();
     loadList(false);
   }, 250);
 });
