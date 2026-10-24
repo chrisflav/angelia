@@ -10,32 +10,45 @@
 </head>
 <body>
   <div id="login" class="login" hidden>
-    <form id="login-form">
+    <form id="login-form" class="login-box">
       <h1>angelia</h1>
-      <input id="password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
-      <button type="submit">Sign in</button>
-      <p id="login-error" class="error"></p>
+      <label for="password">Password</label>
+      <input id="password" type="password" autocomplete="current-password" autofocus>
+      <button class="primary" type="submit">Sign in</button>
+      <p id="login-error" class="error" role="alert"></p>
     </form>
-    <div id="second-factor" class="second-factor" hidden></div>
+    <div id="second-factor" class="login-box" hidden></div>
   </div>
   <div id="app" class="app" hidden>
-    <nav id="sidebar" class="sidebar"></nav>
+    <nav id="sidebar" class="sidebar" aria-label="Folders, labels and sources"></nav>
     <main class="main">
       <header class="toolbar">
-        <input id="search" type="search" placeholder="Search  ( / )">
-        <select id="group" title="Group by">
-          <option value="">No grouping</option>
-          <option value="thread">Group by thread</option>
-          <option value="source">Group by source</option>
-          <option value="day">Group by day</option>
-        </select>
-        <button id="save-view" title="Save the current filter as a view">Save view</button>
-        <span id="live" class="live" title="Live updates">●</span>
+        <button id="menu" class="menu" aria-label="Show folders">Folders</button>
+        <input id="search" type="search" placeholder="Search" aria-label="Search">
+        <label class="inline-field">Sort
+          <select id="sort">
+            <option value="newest">Newest first</option>
+            <option value="oldest">Oldest first</option>
+            <option value="arrived">Recently received</option>
+          </select>
+        </label>
+        <label class="inline-field">Group
+          <select id="group">
+            <option value="">None</option>
+            <option value="day">Day</option>
+            <option value="thread">Conversation</option>
+            <option value="sender">Sender</option>
+            <option value="source">Source</option>
+          </select>
+        </label>
+        <button id="save-view">Save view</button>
+        <span id="live" class="live" title="Live updates are off"></span>
       </header>
-      <div class="panes">
-        <section id="list" class="list" tabindex="0"></section>
-        <section id="detail" class="detail"></section>
+      <div id="panes" class="panes">
+        <section id="list" class="list" tabindex="0" aria-label="Notifications"></section>
+        <article id="detail" class="detail"></article>
       </div>
+      <section id="page" class="page" hidden></section>
     </main>
   </div>
 </body>

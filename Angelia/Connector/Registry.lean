@@ -24,6 +24,11 @@ structure Kind where
 def normalizeIngest (payload : Json) : Except String NotificationData := do
   fromJson? (← payload.getObjVal? "notification")
 
+/-- Bumped whenever a normaliser changes what it produces. At start, notifications derived by an
+    older version are re-derived from their raw events (see `Angelia.replay`), so a change shows
+    on what is already stored, not only on what arrives next. -/
+def normalizerVersion : Nat := 2
+
 def kinds : Array Kind := #[
   { name := "imap", normalize := ImapSource.normalize, run := some ImapSource.run },
   { name := "github", normalize := GitHub.normalize, run := some GitHub.run },

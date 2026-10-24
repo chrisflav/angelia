@@ -224,12 +224,63 @@ def decodeTransfer (encoding : String) (body : String) : ByteArray :=
   | "quoted-printable" => quotedPrintableDecode body
   | _ => toBytes body
 
-/-- A very small HTML-to-text pass for messages that only come as HTML: drop `<style>`/`<script>`
-    blocks and tags, turn block ends into newlines, and resolve the common entities. -/
-partial def htmlToText (html : String) : String :=
-  let s := dropBlocks (dropBlocks html "style") "script"
-  let text := go s.toList [] false
-  collapseBlankLines (decodeEntities text)
+/-- The value of attribute `name` in the inside of a tag (`a href="…" class=…`), if present. -/
+def tagAttr (tag name : String) : Option String := do
+  let lower := tag.toLower
+  let parts := lower.splitOn s!"{name}="
+  if parts.length < 2 then none
+  -- The position in the original, so the value keeps its case.
+  let start := (parts.headD "").length + name.length + 1
+  let rest := (tag.drop start).toString
+  match rest.front with
+  | '"' => some ((rest.drop 1).takeWhile (· != '"')).toString
+  | '\'' => some ((rest.drop 1).takeWhile (· != '\'')).toString
+  | _ => some (rest.takeWhile (fun c => !c.isWhitespace && c != '>')).toString
+
+/-- A small HTML-to-text pass for messages that only come as HTML. Tags go, block ends become
+    line breaks, `<blockquote>` becomes `> `-prefixed lines (so a quoted reply looks like one in a
+    plain-text mail), list items get a `- `, and a link keeps its target as `[text](url)` -- the
+    one piece of Markdown the reader renders in mail. `<style>` and `<script>` blocks are dropped
+    and entities resolved. -/
+partial def htmlToText (html : String) : String := Id.run do
+  let s := dropBlocks (dropBlocks (dropBlocks html "style") "script") "head"
+  let cs := s.toList.toArray
+  let mut out : Array Char := #[]
+  let mut depth := 0
+  let mut link : Option (String × Nat) := none
+  let mut i := 0
+  let newline (out : Array Char) (depth : Nat) : Array Char :=
+    (out.push '\n') ++ (List.replicate depth "> ".toList).flatten.toArray
+  while i < cs.size do
+    let c := cs[i]!
+    if c != '<' then
+      out := out.push (if c == '\n' || c == '\r' || c == '\t' then ' ' else c)
+      i := i + 1
+      continue
+    let mut j := i + 1
+    while j < cs.size && cs[j]! != '>' do j := j + 1
+    let tag := String.ofList (cs.extract (i + 1) j).toList
+    i := j + 1
+    let name := (tag.takeWhile (fun c => c.isAlphanum || c == '/')).toString.toLower
+    match name with
+    | "br" | "p" | "/p" | "div" | "/div" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4" | "/table"
+    | "hr" | "/ul" | "/ol" => out := newline out depth
+    | "li" => out := newline out depth ++ "- ".toList.toArray
+    | "blockquote" => depth := depth + 1; out := newline out depth
+    | "/blockquote" => depth := depth - 1; out := newline out depth
+    | "a" => link := (tagAttr tag "href").map (·.trimAscii.toString, out.size)
+    | "/a" =>
+      if let some (href, start) := link then
+        let text := String.ofList (out.extract start out.size).toList |>.trimAscii |>.toString
+        let usable := href.startsWith "http://" || href.startsWith "https://" ||
+          href.startsWith "mailto:"
+        if usable && !text.isEmpty && text != href then
+          out := (out.extract 0 start) ++ s!"[{text}]({href})".toList.toArray
+        else if usable && text.isEmpty then
+          out := out ++ href.toList.toArray
+      link := none
+    | _ => pure ()
+  return collapseBlankLines (decodeEntities (String.ofList out.toList))
 where
   dropBlocks (s tag : String) : String :=
     match s.splitOn s!"<{tag}" with
@@ -238,21 +289,35 @@ where
         match chunk.splitOn s!"</{tag}>" with
         | _ :: after@(_ :: _) => s!"</{tag}>".intercalate after
         | _ => "")
-  go : List Char → List Char → Bool → String
-    | [], acc, _ => String.ofList acc.reverse
-    | '<' :: rest, acc, _ =>
-      let (tag, rest') := rest.span (· != '>')
-      let name := (String.ofList (tag.takeWhile (fun c => c.isAlphanum || c == '/'))).toLower
-      let block := ["br", "/p", "p", "/div", "/tr", "/li", "/h1", "/h2", "/h3", "/table"].contains name
-      go (rest'.drop 1) (if block then '\n' :: acc else acc) true
-    | c :: rest, acc, inTag => go rest (c :: acc) inTag
   decodeEntities (s : String) : String :=
-    [("&nbsp;", " "), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"),
-      ("&apos;", "'"), ("&euro;", "€"), ("&amp;", "&")].foldl (fun acc (e, r) => acc.replace e r) s
+    let named := [("&nbsp;", " "), ("&lt;", "<"), ("&gt;", ">"), ("&quot;", "\""), ("&#39;", "'"),
+      ("&apos;", "'"), ("&euro;", "€"), ("&ndash;", "–"), ("&mdash;", "—"), ("&hellip;", "…"),
+      ("&rsquo;", "’"), ("&lsquo;", "‘"), ("&rdquo;", "”"), ("&ldquo;", "“"), ("&shy;", ""),
+      ("&zwnj;", ""), ("&auml;", "ä"), ("&ouml;", "ö"), ("&uuml;", "ü"), ("&Auml;", "Ä"),
+      ("&Ouml;", "Ö"), ("&Uuml;", "Ü"), ("&szlig;", "ß")]
+    let s := named.foldl (fun acc (e, r) => acc.replace e r) s
+    numeric s |>.replace "&amp;" "&"
+  /-- `&#8212;` and `&#x2014;`. -/
+  numeric (s : String) : String :=
+    match s.splitOn "&#" with
+    | [] => s
+    | first :: rest => first ++ String.join (rest.map fun chunk =>
+        let (num, after) := (chunk.takeWhile (· != ';'), chunk.dropWhile (· != ';'))
+        let n := if num.startsWith "x" || num.startsWith "X" then
+            (num.drop 1).toString.toList.foldl (fun acc c =>
+              acc.bind fun a => (if c.isDigit then some (c.toNat - '0'.toNat)
+                else if 'a' ≤ c.toLower && c.toLower ≤ 'f' then
+                  some (c.toLower.toNat - 'a'.toNat + 10)
+                else none).map (a * 16 + ·)) (some 0)
+          else num.toString.toNat?
+        match n, after.toString.startsWith ";" with
+        | some n, true => (Char.ofNat n).toString ++ (after.drop 1).toString
+        | _, _ => "&#" ++ chunk)
   collapseBlankLines (s : String) : String :=
     let lines := (s.splitOn "\n").map (·.trimAscii.toString)
+    let blank (l : String) := l.isEmpty || l.all (fun c => c == '>' || c == ' ')
     let kept := lines.foldl (fun (acc : List String) l =>
-      if l.isEmpty && (acc.head?.map String.isEmpty |>.getD true) then acc else l :: acc) []
+      if blank l && (acc.head?.map blank |>.getD true) then acc else l :: acc) []
     "\n".intercalate kept.reverse |>.trimAscii.toString
 
 /-- The readable text of a MIME entity, given its headers and (byte-string) body: the first

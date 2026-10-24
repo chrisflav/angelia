@@ -142,6 +142,12 @@ def schemaSql : String := "
     last_used INTEGER
   );
 
+  -- Small facts about the database itself, such as which normalisers derived its notifications.
+  CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
+
   -- The data key, wrapped under the configured unlock key, so the server unlocks at start.
   CREATE TABLE IF NOT EXISTS unlock_key (
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -263,6 +269,7 @@ private structure NotificationRow where
   archived : Bool
   starred : Bool
   labels : Option String
+  time : Int64
 deriving SQLite.Row, Inhabited
 
 /-- The decrypted content: the external id and the normalised fields, with the thread key in the
@@ -284,7 +291,8 @@ private def NotificationRow.toNotification (k : Vault.Keys) (r : NotificationRow
            data := { data with threadKey := r.threadKey }
            receivedAt := r.receivedAt.toInt, read := r.read, archived := r.archived
            starred := r.starred
-           labels := ((r.labels.getD "").splitOn ",").filterMap String.toInt? |>.toArray }
+           labels := ((r.labels.getD "").splitOn ",").filterMap String.toInt? |>.toArray
+           time := r.time.toInt }
 
 /-- A notification list query. `none` means "don't filter on this". -/
 structure Filter where
@@ -294,27 +302,31 @@ structure Filter where
   /-- `inbox` (not archived), `unread`, `archived`, `starred`, or `all`. -/
   state : String := "inbox"
   thread : Option String := none
-  /-- Keyset pagination: only rows with `id` below this. -/
-  before : Option Int := none
+  /-- `newest` (by the time it was sent), `oldest`, or `arrived` (newest by when it arrived). -/
+  sort : String := "newest"
+  /-- Keyset pagination: only rows after this `(time, id)` in the sort order. -/
+  before : Option (Int × Int) := none
   limit : Nat := 100
 deriving Inhabited
 
-/-- One page of a notification query without the text search, newest first. -/
+/-- One page of a notification query without the text search, in the filter's sort order. -/
 private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
     IO (Array NotificationRow) := do
   let (srcs, lbls) := scope.sqlArgs
   let label := f.label.map i64
-  let before := f.before.map i64
+  let bt := f.before.map (i64 ·.1)
+  let bid := f.before.map (i64 ·.2)
   let limit : Int64 := Int64.ofNat limit
-  (← db query!"SELECT n.id, n.source, n.external_id, n.kind, n.thread_key, n.content, n.sent_at,
-      n.received_at, n.read, n.archived, n.starred,
-      (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id)
+  (← db query!"SELECT * FROM (SELECT n.id, n.source, n.external_id, n.kind, n.thread_key,
+      n.content, n.sent_at, n.received_at, n.read, n.archived, n.starred,
+      (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id),
+      CASE WHEN {f.sort} = 'arrived' OR n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END AS t
     FROM notification n
     WHERE ({f.source} IS NULL OR n.source = {f.source})
       AND ({f.thread} IS NULL OR n.thread_key = {f.thread})
       AND ({label} IS NULL OR EXISTS (SELECT 1 FROM notification_label l
             WHERE l.notification_id = n.id AND l.label_id = {label}))
-      AND ({before} IS NULL OR n.id < {before})
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
             WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
@@ -323,8 +335,13 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
         WHEN 'unread' THEN n.archived = 0 AND n.read = 0
         WHEN 'archived' THEN n.archived = 1
         WHEN 'starred' THEN n.starred = 1
-        ELSE 1 END
-    ORDER BY n.id DESC LIMIT {limit}" as NotificationRow).toArray
+        ELSE 1 END)
+    WHERE {bt} IS NULL OR CASE WHEN {f.sort} = 'oldest'
+      THEN t > {bt} OR (t = {bt} AND id > {bid})
+      ELSE t < {bt} OR (t = {bt} AND id < {bid}) END
+    ORDER BY CASE WHEN {f.sort} = 'oldest' THEN t ELSE -t END,
+      CASE WHEN {f.sort} = 'oldest' THEN id ELSE -id END
+    LIMIT {limit}" as NotificationRow).toArray
 
 /-- Run a notification query, newest first. A text search (case-insensitive, on title, body and
     author) decrypts candidates page by page until it has `limit` matches. -/
@@ -344,7 +361,7 @@ def listNotifications (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notif
       if out.size < limit && (hit n.data.title || hit n.data.body || hit n.data.author) then
         out := out.push n
     if rows.size < pageSize || out.size ≥ limit then break
-    f := { f with before := rows.back?.map (·.id.toInt) }
+    f := { f with before := rows.back?.map fun r => (r.time.toInt, r.id.toInt) }
   return out
 
 /-- A notification, if it exists and is visible under `scope`. -/
@@ -352,7 +369,9 @@ def getNotification (db : Conn) (scope : Scope) (id : Int) : IO (Option Notifica
   let (srcs, lbls) := scope.sqlArgs
   let rows ← (← db query!"SELECT n.id, n.source, n.external_id, n.kind, n.thread_key, n.content,
       n.sent_at, n.received_at, n.read, n.archived, n.starred,
-      (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id)
+      (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id),
+      CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at THEN n.received_at
+        ELSE n.sent_at END
     FROM notification n WHERE n.id = {i64 id}
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
@@ -497,7 +516,7 @@ def rerunRules (db : Conn) : IO Nat := withTransaction db do
   db.exec "DELETE FROM notification_label WHERE rule_id IS NOT NULL"
   let k ← Vault.keys
   let rows ← (← db query!"SELECT n.id, n.source, n.external_id, n.kind, n.thread_key, n.content,
-      n.sent_at, n.received_at, n.read, n.archived, n.starred, NULL
+      n.sent_at, n.received_at, n.read, n.archived, n.starred, NULL, n.received_at
     FROM notification n" as NotificationRow).toArray
   let mut matched := 0
   for r in rows do
@@ -575,6 +594,16 @@ def setSecret (db : Conn) (source key value : String) : IO Unit := do
   let sealed ← Vault.seal (← Vault.keys) (secretAad source key) value
   db exec!"INSERT INTO secret (source, key, value) VALUES ({source}, {key}, {sealed})
     ON CONFLICT (source, key) DO UPDATE SET value = excluded.value"
+
+/-! ## Meta -/
+
+def getMeta (db : Conn) (key : String) : IO (Option String) := do
+  let rows ← (← db query!"SELECT value FROM meta WHERE key = {key}" as String).toArray
+  return rows[0]?
+
+def setMeta (db : Conn) (key value : String) : IO Unit :=
+  db exec!"INSERT INTO meta (key, value) VALUES ({key}, {value})
+    ON CONFLICT (key) DO UPDATE SET value = excluded.value"
 
 /-! ## Second factors -/
 

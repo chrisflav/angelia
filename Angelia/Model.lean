@@ -62,6 +62,9 @@ structure Notification where
   archived : Bool
   starred : Bool
   labels : Array Int
+  /-- The time it is sorted and shown by: when it was sent, unless that is unknown or claims to
+      be later than its arrival (a wrong clock), else when it arrived. -/
+  time : Int
 deriving Inhabited
 
 instance : ToJson Notification where
@@ -70,7 +73,8 @@ instance : ToJson Notification where
     ("kind", n.data.kind), ("threadKey", toJson n.data.threadKey), ("author", n.data.author),
     ("title", n.data.title), ("body", n.data.body), ("url", toJson n.data.url),
     ("sentAt", toJson n.data.sentAt), ("receivedAt", n.receivedAt), ("read", n.read),
-    ("archived", n.archived), ("starred", n.starred), ("labels", toJson n.labels)]
+    ("archived", n.archived), ("starred", n.starred), ("labels", toJson n.labels),
+    ("time", n.time)]
 
 /-- A user-defined label. Labels are how notifications are organised, independently of where they
     came from. -/

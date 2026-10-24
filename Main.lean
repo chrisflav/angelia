@@ -42,7 +42,17 @@ def unlockFromStdin (config : Config) (db : Db.Conn) : IO Unit := do
     throw (IO.userError "wrong password")
   Db.unlock db password (← loadUnlockKey config)
 
+/-- Re-derive the stored notifications if the normalisers changed since they were derived. -/
+def rederiveIfNeeded (config : Config) : IO Unit := do
+  let db ← Db.connect config.dbPath
+  let current := toString Connector.normalizerVersion
+  if (← Db.getMeta db "normalizers") == some current then return
+  let (n, failed) ← replay db (Connector.normalizerFor config.sources) none
+  Db.setMeta db "normalizers" current
+  log "main" s!"re-derived {n} notification(s) with the current normalisers, {failed} failed"
+
 def startSources (config : Config) : IO Unit := do
+  try rederiveIfNeeded config catch e => log "main" s!"re-deriving failed: {e}"
   let stop ← IO.mkRef false
   for source in config.sources do
     if !source.enabled then continue

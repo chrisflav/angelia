@@ -359,14 +359,24 @@ def listNotifications (ctx : AppContext) (scope : Scope) (r : Req) : ApiM ApiRes
     | some v => if v.isEmpty then pure none else some <$> parseId v
     | none => pure none
   let nonEmpty (k : String) := (r.query k).filter (!·.isEmpty)
+  -- The cursor is `<time>.<id>` of the last item of the previous page.
+  let before ← match nonEmpty "before" with
+    | none => pure none
+    | some c => match c.splitOn "." |>.map String.toInt? with
+      | [some t, some id] => pure (some (t, id))
+      | _ => fail (.badRequest "invalid 'before' cursor")
+  let sort := (nonEmpty "sort").getD "newest"
+  if !["newest", "oldest", "arrived"].contains sort then
+    fail (.badRequest "'sort' is one of newest, oldest, arrived")
   let f : Db.Filter := {
     q := nonEmpty "q", source := nonEmpty "source", thread := nonEmpty "thread"
-    label := ← num "label", before := ← num "before"
+    label := ← num "label", before, sort
     state := (nonEmpty "state").getD "inbox"
     limit := ((← num "limit").map Int.toNat).getD 100 }
   let ns ← ctx.dbM (Db.listNotifications · scope f)
   ok (Json.mkObj [("notifications", toJson ns),
-    ("next", toJson (if ns.size < f.limit then none else ns.back?.map (·.id)))])
+    ("next", toJson (if ns.size < f.limit then none
+      else ns.back?.map fun n => s!"{n.time}.{n.id}"))])
 
 /-- A notification the scope cannot see is reported as missing, not as forbidden, so a token cannot
     probe which ids exist outside its scope. -/
@@ -579,6 +589,8 @@ def contentTypeOf (name : String) : String :=
   else if name.endsWith ".js" then "text/javascript; charset=utf-8"
   else if name.endsWith ".css" then "text/css; charset=utf-8"
   else if name.endsWith ".svg" then "image/svg+xml"
+  else if name.endsWith ".woff2" then "font/woff2"
+  else if name.endsWith ".txt" then "text/plain; charset=utf-8"
   else "application/octet-stream"
 
 /-- Security headers for the frontend: the app loads nothing from anywhere else. -/

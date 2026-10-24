@@ -58,6 +58,15 @@ def htmlMail : String := crlf [
   "L3A+PHA+NSAmZXVybzsgY2hhcmdlZCCAPC9wPjwvaHRtbD4="]
 
 def mimeTests (s : Suite) : IO Unit := do
+  s.eq "html: links keep their target"
+    (htmlToText "see <a href=\"https://x.org/a?b=1&amp;c=2\" target=_blank>the slides</a>, <a href='https://y.org'>https://y.org</a>")
+    "see [the slides](https://x.org/a?b=1&c=2), https://y.org"
+  s.eq "html: blockquotes become quoted lines"
+    (htmlToText "Fine.<div>On Monday A wrote:</div><blockquote>Sure.<br>Which room?</blockquote>")
+    "Fine.\nOn Monday A wrote:\n\n> Sure.\n> Which room?"
+  s.eq "html: list items and numeric entities"
+    (htmlToText "<ul><li>one</li><li>two &#8211; &#x2603;</li></ul>") "- one\n- two – ☃"
+  s.eq "html: script links are not kept" (htmlToText "<a href=\"javascript:alert(1)\">click</a>") "click"
   IO.println "mime"
   let m := parseMessage multipartMail
   s.eq "encoded-word from" m.from "Jürgen Müller <jm@example.org>"
