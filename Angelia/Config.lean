@@ -61,7 +61,8 @@ instance : FromJson Config where
       port := (← opt "port" d.port.toNat).toUInt16
       dbPath := (← opt "dbPath" d.dbPath.toString : String)
       staticDir := (← opt "staticDir" d.staticDir.toString : String)
-      passwordHash := ← opt "passwordHash" none
+      -- Empty counts as unset, so an unfilled secret leaves the server refusing logins.
+      passwordHash := (← opt "passwordHash" none).filter (!·.isEmpty)
       secureCookies := ← opt "secureCookies" d.secureCookies
       sessionDays := ← opt "sessionDays" d.sessionDays
       sources := ← opt "sources" #[] }
