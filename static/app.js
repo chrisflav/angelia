@@ -49,12 +49,63 @@ async function api(method, path, body) {
 
 /* ---------- login ---------- */
 
+const fromB64 = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
 function showLogin(message) {
   events?.close();
   $("login-error").textContent = message || "";
+  $("second-factor").hidden = true;
+  $("login-form").hidden = false;
   $("app").hidden = true;
   $("login").hidden = false;
   $("password").focus();
+}
+
+/** The second step of signing in: a tap on a security key, or a code from an app. */
+function showSecondFactor(sf) {
+  const error = h("p", { class: "error" });
+  const finish = async (answer) => {
+    try {
+      await api("POST", "login/second-factor", { pending: sf.pending, ...answer });
+      $("login").hidden = true;
+      start();
+    } catch (err) { error.textContent = err.message; }
+  };
+  // The request is started on its own as soon as this shows; the button restarts it, which a
+  // browser allows only once the one still waiting has been cancelled.
+  let waiting;
+  const tap = async () => {
+    error.textContent = "";
+    waiting?.abort();
+    waiting = new AbortController();
+    try {
+      const cred = await navigator.credentials.get({ signal: waiting.signal, publicKey: {
+        challenge: fromB64(sf.webauthn.challenge), rpId: sf.webauthn.rpId,
+        allowCredentials: sf.webauthn.allowCredentials.map((id) => ({ type: "public-key", id: fromB64(id) })),
+        userVerification: "discouraged", timeout: 60000 } });
+      await finish({ credentialId: cred.id, clientDataJSON: toB64(cred.response.clientDataJSON),
+        authenticatorData: toB64(cred.response.authenticatorData), signature: toB64(cred.response.signature) });
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      error.textContent = err.name === "NotAllowedError" ? "No key was tapped." : err.message;
+    }
+  };
+  const code = h("input", { placeholder: "6-digit code", inputmode: "numeric", autocomplete: "one-time-code" });
+  code.addEventListener("keydown", (e) => { if (e.key === "Enter") finish({ code: code.value }); });
+  $("login-form").hidden = true;
+  $("second-factor").hidden = false;
+  $("second-factor").replaceChildren(
+    h("h1", {}, "angelia"),
+    sf.webauthn ? h("p", {}, "Insert your security key and tap it.") : null,
+    sf.webauthn ? h("button", { type: "button", onclick: tap }, "Use security key") : null,
+    sf.totp ? h("p", {}, sf.webauthn ? "Or enter the code from your authenticator app:" : "Enter the code from your authenticator app:") : null,
+    sf.totp ? code : null,
+    sf.totp ? h("button", { type: "button", onclick: () => finish({ code: code.value }) }, "Verify code") : null,
+    error,
+    h("a", { href: "#", onclick: (e) => { e.preventDefault(); showLogin(); } }, "Start over"));
+  if (sf.webauthn) tap(); else code.focus();
 }
 
 $("login-form")?.addEventListener("submit", async (e) => {
@@ -62,10 +113,11 @@ $("login-form")?.addEventListener("submit", async (e) => {
   const button = e.target.querySelector("button");
   button.disabled = true;
   try {
-    await api("POST", "login", { password: $("password").value });
+    const res = await api("POST", "login", { password: $("password").value });
     $("password").value = "";
     $("login-error").textContent = "";
-    start();
+    if (res.secondFactor) showSecondFactor(res.secondFactor);
+    else start();
   } catch (err) {
     $("login-error").textContent = err.message;
   } finally {
@@ -181,6 +233,7 @@ function renderSidebar() {
   items.push(navItem("Rules", state.view === "rules", showRules));
   items.push(navItem("Source health", state.view === "sources", showSources));
   items.push(navItem("API tokens", state.view === "tokens", () => showTokens()));
+  items.push(navItem("Sign-in security", state.view === "security", () => showSecurity()));
   $("sidebar").replaceChildren(...items);
 }
 
@@ -508,6 +561,97 @@ async function showTokens(created) {
           showTokens();
         } }, "Revoke")))))
       : h("p", { class: "hint" }, "No tokens yet."));
+}
+
+/* ---------- sign-in security ---------- */
+
+async function showSecurity(notice) {
+  state.view = "security";
+  renderSidebar();
+  const factors = await api("GET", "second-factors");
+  const date = (t) => t ? new Date(t * 1000).toLocaleString() : "never";
+  const password = h("input", { type: "password", placeholder: "Your password", autocomplete: "current-password" });
+  const error = h("span", { class: "error" });
+  const needPassword = () => {
+    if (password.value) return true;
+    error.textContent = "Enter your password first.";
+    password.focus();
+    return false;
+  };
+  const run = (act) => async () => {
+    error.textContent = "";
+    if (!needPassword()) return;
+    try { await act(); } catch (err) {
+      error.textContent = err.name === "NotAllowedError" ? "No key was tapped." : err.message;
+    }
+  };
+
+  const keyName = h("input", { placeholder: "Name, e.g. Titan" });
+  const addKey = run(async () => {
+    const o = await api("POST", "second-factors/webauthn/challenge");
+    const cred = await navigator.credentials.create({ publicKey: {
+      challenge: fromB64(o.challenge), rp: o.rp,
+      user: { id: fromB64(o.user.id), name: o.user.name, displayName: o.user.displayName },
+      pubKeyCredParams: [{ type: "public-key", alg: -7 }],
+      excludeCredentials: o.excludeCredentials.map((id) => ({ type: "public-key", id: fromB64(id) })),
+      authenticatorSelection: { residentKey: "discouraged", userVerification: "discouraged" },
+      attestation: "none", timeout: 60000 } });
+    await api("POST", "second-factors/webauthn", { password: password.value,
+      name: keyName.value.trim() || "Security key",
+      clientDataJSON: toB64(cred.response.clientDataJSON),
+      authenticatorData: toB64(cred.response.getAuthenticatorData()),
+      publicKey: toB64(cred.response.getPublicKey()), alg: cred.response.getPublicKeyAlgorithm() });
+    showSecurity("Security key added.");
+  });
+
+  const appName = h("input", { placeholder: "Name, e.g. phone" });
+  const appSetup = h("div");
+  const addApp = run(async () => {
+    const o = await api("POST", "second-factors/totp/secret");
+    const qr = qrcode(0, "M");
+    qr.addData(o.uri);
+    qr.make();
+    const code = h("input", { placeholder: "6-digit code", inputmode: "numeric" });
+    const confirmApp = run(async () => {
+      await api("POST", "second-factors/totp", { password: password.value,
+        name: appName.value.trim() || "Authenticator app", code: code.value });
+      showSecurity("Authenticator app added.");
+    });
+    code.addEventListener("keydown", (e) => { if (e.key === "Enter") confirmApp(); });
+    appSetup.replaceChildren(
+      h("p", { class: "hint" }, "Scan this with the app, then enter the code it shows."),
+      h("img", { src: qr.createDataURL(5, 4), alt: "QR code for the authenticator app" }),
+      h("p", { class: "hint" }, "Or enter the key by hand: ", h("code", {}, o.secret)),
+      h("div", { class: "row" }, code, h("button", { class: "primary", onclick: confirmApp }, "Confirm")));
+    code.focus();
+  });
+
+  const kinds = { webauthn: "security key", totp: "authenticator app" };
+  $("detail").replaceChildren(
+    h("h1", {}, "Sign-in security"),
+    h("p", { class: "hint" }, "With a security key or an authenticator app registered, signing in takes ",
+      "the password and then a tap on the key or a code from the app. Register two, so that losing ",
+      "one does not lock you out. API tokens are not affected."),
+    notice ? h("div", { class: "rule" }, h("strong", {}, notice)) : null,
+    h("div", { class: "row" }, password, error),
+    h("div", { class: "rule" },
+      h("strong", {}, "Add a security key"),
+      h("div", { class: "row" }, keyName, h("button", { class: "primary", onclick: addKey }, "Add and tap"))),
+    h("div", { class: "rule" },
+      h("strong", {}, "Add an authenticator app"),
+      h("div", { class: "row" }, appName, h("button", { class: "primary", onclick: addApp }, "Set up")),
+      appSetup),
+    factors.length ? h("table", {},
+      h("tr", {}, ["Name", "Kind", "Added", "Last used", ""].map((t) => h("th", {}, t))),
+      factors.map((f) => h("tr", {},
+        h("td", {}, f.name), h("td", {}, kinds[f.kind] || f.kind),
+        h("td", {}, date(f.createdAt)), h("td", {}, date(f.lastUsed)),
+        h("td", {}, h("button", { onclick: run(async () => {
+          if (!confirm(`Remove "${f.name}"?`)) return;
+          await api("DELETE", "second-factors/" + f.id, { password: password.value });
+          showSecurity(`Removed "${f.name}".`);
+        }) }, "Remove")))))
+      : h("p", { class: "hint" }, "None yet: signing in takes the password alone."));
 }
 
 /* ---------- keyboard, search, live updates ---------- */

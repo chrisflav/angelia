@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>angelia</title>
   <link rel="stylesheet" href="/style.css">
+  <script src="/vendor/qrcode.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
@@ -15,6 +16,7 @@
       <button type="submit">Sign in</button>
       <p id="login-error" class="error"></p>
     </form>
+    <div id="second-factor" class="second-factor" hidden></div>
   </div>
   <div id="app" class="app" hidden>
     <nav id="sidebar" class="sidebar"></nav>

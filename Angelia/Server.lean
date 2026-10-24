@@ -2,6 +2,7 @@ import Std.Http
 import Std.Sync.Mutex
 import Angelia.Connector.Registry
 import Angelia.Crypto
+import Angelia.SecondFactor
 
 /-!
 # HTTP server
@@ -20,6 +21,10 @@ mint more tokens. Only hashes of sessions and tokens are stored.
 `/api/ingest/<source>` is authenticated separately, by that source's own bearer token, since the
 programs posting to it are not clients of the inbox.
 
+When second factors are registered, a sign-in takes the password and then a tap on a security
+key or a code from an authenticator app (see `Angelia.SecondFactor`); registering or removing
+one takes the password again, so a stolen session cookie cannot swap in its own.
+
 Until the first sign-in after a start the server is locked (see `Angelia.Vault`): that sign-in
 unwraps the database key and starts the sources, and everything else answers 503 meanwhile.
 -/
@@ -28,6 +33,13 @@ open Std.Http Std.Http.Server Std.Async Std.Net Lean
 
 namespace Angelia.Server
 
+/-- A challenge waiting for its answer, under a key saying what it is for. -/
+structure Pending where
+  key : String
+  value : String
+  expires : Int
+  attempts : Nat := 0
+
 structure AppContext where
   config : Config
   db : Std.Mutex Db.Conn
@@ -35,6 +47,9 @@ structure AppContext where
   onUnlock : IO Unit
   /-- Held while a password is checked, so attempts are made one at a time. -/
   loginLock : Std.Mutex Unit
+  /-- Challenges in flight: a sign-in waiting for its second factor, or a factor being
+      registered. Kept in memory only; a restart simply makes them start over. -/
+  pending : IO.Ref (Array Pending)
 
 def AppContext.withDb (ctx : AppContext) (act : Db.Conn → IO α) : IO α :=
   ctx.db.atomically do act (← get)
@@ -151,30 +166,178 @@ def AppContext.authenticate (ctx : AppContext) (r : Req) : IO (Option Principal)
 def cookieAttrs (ctx : AppContext) : String :=
   "; Path=/; HttpOnly; SameSite=Strict" ++ (if ctx.config.secureCookies then "; Secure" else "")
 
-/-- Check the password and, on the first sign-in after a start, unlock the server with it. -/
-def login (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+def AppContext.rp (ctx : AppContext) : SecondFactor.RelyingParty :=
+  .ofOrigin ctx.config.publicOrigin
+
+/-- How long a challenge stays answerable, in seconds. -/
+def pendingSeconds : Int := 300
+
+/-- How many answers one sign-in challenge takes before it is spent; with a six-digit code and a
+    password needed for every new challenge, guessing a code is hopeless. -/
+def pendingAttempts : Nat := 5
+
+def AppContext.putPending (ctx : AppContext) (key value : String) : IO Unit := do
+  let now ← nowSeconds
+  ctx.pending.modify fun ps =>
+    (ps.filter fun p => p.key != key && p.expires > now).push
+      { key, value, expires := now + pendingSeconds }
+
+/-- The challenge under `key`, counting this as one attempt at answering it. -/
+def AppContext.attemptPending (ctx : AppContext) (key : String) : IO (Option Pending) := do
+  let now ← nowSeconds
+  ctx.pending.modifyGet fun ps =>
+    let ps := ps.filter (·.expires > now)
+    match ps.find? (·.key == key) with
+    | none => (none, ps)
+    | some p =>
+      let others := ps.filter (·.key != key)
+      if p.attempts + 1 ≥ pendingAttempts then (some p, others)
+      else (some p, others.push { p with attempts := p.attempts + 1 })
+
+def AppContext.dropPending (ctx : AppContext) (key : String) : IO Unit :=
+  ctx.pending.modify (·.filter (·.key != key))
+
+/-- Check the password, one attempt at a time; a wrong one holds the lock a second longer, so
+    guessing runs at about one try per second however many connections it uses. -/
+def checkPassword (ctx : AppContext) (password : String) : ApiM Unit := do
   let some stored := ctx.config.passwordHash
     | fail (.unauthorized "no password configured (set passwordHash)")
   let hash ← match Vault.PasswordHash.parse stored with
     | .ok h => pure h
     | .error e => fail (.server e)
-  let password : String ← field (← parseJson r.body) "password"
-  -- One attempt at a time, and a failed one holds the lock a second longer, so guessing runs at
-  -- about one try per second however many connections it uses.
   let correct ← liftIO <| ctx.loginLock.atomically do
-    if !hash.verify password then
-      IO.sleep 1000
-      return false
-    if !(← Vault.unlocked) then
-      ctx.withDb (Db.unlock · password)
-      log "main" "unlocked"
-      ctx.onUnlock
-    return true
+    if hash.verify password then return true
+    IO.sleep 1000
+    return false
   if !correct then fail (.unauthorized "wrong password")
+
+def startSession (ctx : AppContext) : ApiM ApiResponse := do
   let token ← liftIO (randomToken 32)
   ctx.dbM fun db => Db.createSession db (Crypto.sha256Hex token)
   pure { body := Json.mkObj [("ok", true)]
          headers := #[("Set-Cookie", s!"{sessionCookie}={token}{cookieAttrs ctx}; Max-Age={ctx.config.sessionDays * 86400}")] }
+
+/-- A fresh WebAuthn challenge, base64url. -/
+def newChallenge : IO String := return SecondFactor.base64url (← IO.getRandomBytes 32)
+
+/-- Check the password and, on the first sign-in after a start, unlock the server with it. With
+    second factors registered, the answer is a challenge for one of them instead of a session. -/
+def login (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let password : String ← field (← parseJson r.body) "password"
+  checkPassword ctx password
+  liftIO <| ctx.loginLock.atomically do
+    if !(← Vault.unlocked) then
+      ctx.withDb (Db.unlock · password)
+      log "main" "unlocked"
+      ctx.onUnlock
+  let keys ← ctx.dbM Db.webauthnCredentials
+  let apps ← ctx.dbM Db.totpSecrets
+  if keys.isEmpty && apps.isEmpty then return ← startSession ctx
+  let id ← liftIO (randomToken 16)
+  let challenge ← liftIO newChallenge
+  liftIO (ctx.putPending s!"login:{id}" challenge)
+  ok (Json.mkObj [("secondFactor", Json.mkObj [
+    ("pending", id),
+    ("webauthn", if keys.isEmpty then Json.null else Json.mkObj [
+      ("challenge", challenge), ("rpId", ctx.rp.id),
+      ("allowCredentials", toJson (keys.map (·.2.id)))]),
+    ("totp", !apps.isEmpty)])])
+
+def bytesField (j : Json) (k : String) : ApiM ByteArray := do
+  let some b := SecondFactor.unbase64url (← field j k)
+    | fail (.badRequest s!"'{k}' is not base64url")
+  pure b
+
+/-- `POST /api/login/second-factor`: answer the sign-in's challenge, with `{"pending", "code"}`
+    from an app or `{"pending", "credentialId", "clientDataJSON", "authenticatorData",
+    "signature"}` from a security key. -/
+def loginSecondFactor (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let id : String ← field j "pending"
+  let key := s!"login:{id}"
+  let some p ← liftIO (ctx.attemptPending key)
+    | fail (.unauthorized "the sign-in expired; enter the password again")
+  match (← field? j "code" : Option String) with
+  | some code =>
+    let now := (← liftIO nowSeconds).toNat
+    let apps ← ctx.dbM Db.totpSecrets
+    let some (factor, step) := apps.findSome? fun (fid, secret, last) =>
+        (SecondFactor.totpMatch secret now last code).map (fid, ·)
+      | fail (.unauthorized "wrong code")
+    ctx.dbM (Db.factorUsed · factor none (some step))
+  | none =>
+    let credId : String ← field j "credentialId"
+    let keys ← ctx.dbM Db.webauthnCredentials
+    let some (factor, cred) := keys.find? (·.2.id == credId)
+      | fail (.unauthorized "this security key is not registered")
+    match SecondFactor.verifyAssertion ctx.rp p.value cred (← bytesField j "clientDataJSON")
+        (← bytesField j "authenticatorData") (← bytesField j "signature") with
+    | .ok count => ctx.dbM (Db.factorUsed · factor (some count) none)
+    | .error e => fail (.unauthorized e)
+  liftIO (ctx.dropPending key)
+  startSession ctx
+
+/-! ## Managing second factors
+
+From a logged-in session only, and each change takes the password again. -/
+
+def sessionKey (r : Req) : String := Crypto.sha256Hex ((r.cookie sessionCookie).getD "")
+
+def webauthnChallenge (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let challenge ← liftIO newChallenge
+  liftIO (ctx.putPending s!"webauthn:{sessionKey r}" challenge)
+  let keys ← ctx.dbM Db.webauthnCredentials
+  ok (Json.mkObj [("challenge", challenge),
+    ("rp", Json.mkObj [("id", ctx.rp.id), ("name", "angelia")]),
+    -- One account, so one fixed user handle.
+    ("user", Json.mkObj [("id", SecondFactor.base64url "angelia owner".toUTF8),
+      ("name", "angelia"), ("displayName", "angelia")]),
+    ("excludeCredentials", toJson (keys.map (·.2.id)))])
+
+/-- Body: `{"password", "name", "clientDataJSON", "authenticatorData", "publicKey", "alg"}`, the
+    last four from the browser's `AuthenticatorAttestationResponse`. -/
+def addWebAuthn (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  checkPassword ctx (← field j "password")
+  let name : String ← field j "name"
+  let key := s!"webauthn:{sessionKey r}"
+  let some p ← liftIO (ctx.attemptPending key)
+    | fail (.badRequest "the challenge expired; try again")
+  let cred ← match SecondFactor.verifyRegistration ctx.rp p.value (← bytesField j "clientDataJSON")
+      (← bytesField j "authenticatorData") (← bytesField j "publicKey") (← field j "alg") with
+    | .ok c => pure c
+    | .error e => fail (.badRequest e)
+  if (← ctx.dbM Db.webauthnCredentials).any (·.2.id == cred.id) then
+    fail (.badRequest "this security key is already registered")
+  ctx.dbM (Db.addWebAuthn · name cred)
+  liftIO (ctx.dropPending key)
+  ok (Json.mkObj [("ok", true)])
+
+def totpSecret (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let secret ← liftIO (IO.getRandomBytes 20)
+  liftIO (ctx.putPending s!"totp:{sessionKey r}" (Crypto.toHex secret))
+  ok (Json.mkObj [("secret", SecondFactor.base32 secret),
+    ("uri", SecondFactor.totpUri "angelia" ctx.rp.id secret)])
+
+/-- Body: `{"password", "name", "code"}`; the code proves the app has the secret. -/
+def addTotp (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  checkPassword ctx (← field j "password")
+  let name : String ← field j "name"
+  let key := s!"totp:{sessionKey r}"
+  let some p ← liftIO (ctx.attemptPending key) | fail (.badRequest "the setup expired; start again")
+  let secret := Crypto.unhex p.value
+  let now := (← liftIO nowSeconds).toNat
+  let some _ := SecondFactor.totpMatch secret now 0 (← field j "code")
+    | fail (.badRequest "wrong code; check that the phone's clock is right")
+  ctx.dbM (Db.addTotp · name secret)
+  liftIO (ctx.dropPending key)
+  ok (Json.mkObj [("ok", true)])
+
+def deleteFactor (ctx : AppContext) (r : Req) (id : Int) : ApiM ApiResponse := do
+  checkPassword ctx (← field (← parseJson r.body) "password")
+  if ← ctx.dbM (Db.deleteFactor · id) then ok (Json.mkObj [("ok", true)])
+  else fail (.notFound "no such second factor")
 
 def logout (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   if let some token := r.cookie sessionCookie then
@@ -314,6 +477,7 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   match r.method, r.segments with
   | .post, ["login"] => login ctx r
   | .post, ["logout"] => logout ctx r
+  | .post, ["login", "second-factor"] => loginSecondFactor ctx r
   | _, _ =>
   if !(← liftIO Vault.unlocked) then fail .locked
   match r.method, r.segments with
@@ -345,6 +509,12 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   | _, _ =>
   requireSession
   match r.method, r.segments with
+  | .get, ["second-factors"] => ok (← ctx.dbM Db.listFactors)
+  | .post, ["second-factors", "webauthn", "challenge"] => webauthnChallenge ctx r
+  | .post, ["second-factors", "webauthn"] => addWebAuthn ctx r
+  | .post, ["second-factors", "totp", "secret"] => totpSecret ctx r
+  | .post, ["second-factors", "totp"] => addTotp ctx r
+  | .delete, ["second-factors", id] => deleteFactor ctx r (← parseId id)
   | .get, ["tokens"] => ok (← ctx.dbM Db.listTokens)
   | .post, ["tokens"] => createToken ctx r
   | .delete, ["tokens", id] =>

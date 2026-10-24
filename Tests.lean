@@ -6,7 +6,7 @@ import Angelia
 Pure-function tests over recorded or hand-written protocol data. `lake test` runs them.
 -/
 
-open Lean Angelia Angelia.Mail Angelia.Imap
+open Lean Angelia Angelia.Mail Angelia.Imap Angelia.SecondFactor
 
 structure Suite where
   failures : IO.Ref (Array String)
@@ -255,6 +255,69 @@ def oauthTests (s : Suite) : IO Unit := do
   s.eq "curl config" (Http.configFor #[("Authorization", "Bearer t")] (some "x=1"))
     "header = \"Authorization: Bearer t\"\ndata-binary = \"x=1\"\n"
 
+/-- Bytes from lowercase hex, for test vectors. -/
+def unhex (s : String) : ByteArray := Id.run do
+  let d (c : Char) : Nat := if c.isDigit then c.toNat - '0'.toNat else c.toNat - 'a'.toNat + 10
+  let cs := s.toList.toArray
+  let mut out := ByteArray.empty
+  for i in [0:cs.size / 2] do
+    out := out.push (d cs[2 * i]! * 16 + d cs[2 * i + 1]!).toUInt8
+  return out
+
+def secondFactorCryptoTests (s : Suite) : IO Unit := do
+  IO.println "second-factor crypto"
+  s.eq "sha1" (Crypto.toHex (Crypto.sha1 "abc".toUTF8)) "a9993e364706816aba3e25717850c26c9cd0d89d"
+  s.eq "hmac-sha1, RFC 6238 seed at step 1"
+    (Crypto.toHex (Crypto.hmacSha1 "12345678901234567890".toUTF8 (unhex "0000000000000001")))
+    "75a48a19d4cbe100644e8ac1397eea747a2d33ab"
+  -- From Python's `cryptography`: a P-256 key, a message and its ES256 signature.
+  let spki := unhex "3059301306072a8648ce3d020106082a8648ce3d03010703420004471c3e758c4904285bba7e53118ed0f524adeb0757d25bd2f8e7b0d76dfa714cdd520f7aca8a8b917acc37f51de8f0c9bbe3ad858382e702dc25a12d09f7a858"
+  let msg := "angelia webauthn test".toUTF8
+  let sig := unhex "3045022070c834624418539efb019c0ec7b1d9de8eca92b7a2ff29209a6473592885e986022100946b54c9e5eb55764487d8e5093ae4dadebc5fe8167683d56ef74fe49f6cc781"
+  let some key := P256.parseSpki spki | s.check "spki parses" false
+  let some (r, sv) := P256.parseDerSignature sig | s.check "signature parses" false
+  s.check "es256 verifies" (P256.verify key (Crypto.sha256 msg) r sv)
+  s.check "es256 rejects another message" (!P256.verify key (Crypto.sha256 "angelia".toUTF8) r sv)
+  s.check "es256 rejects another signature" (!P256.verify key (Crypto.sha256 msg) r (sv + 1))
+  s.check "off-curve key refused" (P256.parseSpki (spki.set! 90 (spki[90]! ^^^ 1))).isNone
+  s.eq "base64url" (base64url "any carnal pleas".toUTF8) "YW55IGNhcm5hbCBwbGVhcw"
+  s.eq "base64url roundtrip" ((unbase64url (base64url (unhex "fbff00"))).map (·.data)) (some (unhex "fbff00").data)
+  s.eq "base32" (base32 "foobar".toUTF8) "MZXW6YTBOI"
+  let seed := "12345678901234567890".toUTF8
+  s.eq "hotp, RFC 4226" ((List.range 3).map (hotp seed)) [755224, 287082, 359152]
+  -- 59 s is step 1, whose code is 287082.
+  s.eq "totp accepts the current code" (totpMatch seed 59 0 "287 082") (some 1)
+  s.eq "totp accepts one step of drift" (totpMatch seed 89 0 "287082") (some 1)
+  s.eq "totp refuses a spent code" (totpMatch seed 59 1 "287082") none
+  s.eq "totp refuses a wrong code" (totpMatch seed 59 0 "287083") none
+  let rp := RelyingParty.ofOrigin "http://localhost:8093"
+  s.eq "relying party id" rp.id "localhost"
+  -- Built in Python as a browser would hand them over, signed with the key above.
+  let regAuth := unhex "49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97634100000000000000000000000000000000000000000010000102030405060708090a0b0c0d0e0fa5010203262001215820471c3e758c4904285bba7e53118ed0f524adeb0757d25bd2f8e7b0d76dfa714c225820dd520f7aca8a8b917acc37f51de8f0c9bbe3ad858382e702dc25a12d09f7a858"
+  let regCd := unhex "7b2274797065223a2022776562617574686e2e637265617465222c20226368616c6c656e6765223a2022636d566e4c574e6f595778735a57356e5a51222c20226f726967696e223a2022687474703a2f2f6c6f63616c686f73743a38303933227d"
+  match verifyRegistration rp "cmVnLWNoYWxsZW5nZQ" regCd regAuth spki (-7) with
+  | .ok c => s.eq "registration: credential id" c.id (base64url (unhex "000102030405060708090a0b0c0d0e0f"))
+  | .error e => s.check "registration verifies" false e
+  s.check "registration with another challenge is refused"
+    (verifyRegistration rp "b3RoZXI" regCd regAuth spki (-7) matches .error _)
+  s.check "registration with a key not in the authenticator data is refused"
+    (verifyRegistration rp "cmVnLWNoYWxsZW5nZQ" regCd regAuth
+      (unhex "3059301306072a8648ce3d020106082a8648ce3d030107034200046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5")
+      (-7) matches .error _)
+  let auth := unhex "49960de5880e8c687434170f6476605b8fe4aeb9a28632c7995cf3ba831d97630100000005"
+  let cd := unhex "7b2274797065223a2022776562617574686e2e676574222c20226368616c6c656e6765223a20226247396e61573474593268686247786c626d646c222c20226f726967696e223a2022687474703a2f2f6c6f63616c686f73743a38303933222c202263726f73734f726967696e223a2066616c73657d"
+  let asig := unhex "304402204707e6064566433603c83d0cfa38ac5a94c939712e3178ef89e70ae8630fee1f02202c0770b1323c505aef2622b6587e8a878503df8a3fc9d713eff33c333febb768"
+  let cred : Credential := { id := "", publicKey := spki, signCount := 4 }
+  s.eq "assertion verifies, counter advances"
+    (verifyAssertion rp "bG9naW4tY2hhbGxlbmdl" cred cd auth asig).toOption (some 5)
+  s.check "assertion with a stale counter is refused"
+    (verifyAssertion rp "bG9naW4tY2hhbGxlbmdl" { cred with signCount := 5 } cd auth asig matches .error _)
+  s.check "assertion for another origin is refused"
+    (verifyAssertion (RelyingParty.ofOrigin "http://localhost:9999") "bG9naW4tY2hhbGxlbmdl" cred cd auth asig
+      matches .error _)
+  s.check "assertion with a flipped byte is refused"
+    (verifyAssertion rp "bG9naW4tY2hhbGxlbmdl" cred cd (auth.set! 36 6) asig matches .error _)
+
 def main : IO UInt32 := do
   let s : Suite := { failures := ← IO.mkRef #[] }
   mimeTests s
@@ -266,6 +329,7 @@ def main : IO UInt32 := do
   vaultTests s
   changeTests s
   oauthTests s
+  secondFactorCryptoTests s
   let failures ← s.failures.get
   if failures.isEmpty then
     IO.println "all tests passed"

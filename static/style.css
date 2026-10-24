@@ -46,6 +46,9 @@ a { color: var(--accent); }
 .login form { display: grid; gap: 10px; width: 260px; }
 .login h1 { margin: 0 0 8px; font-weight: 600; letter-spacing: 0.02em; }
 .error { color: var(--danger); min-height: 1em; margin: 0; }
+.second-factor { display: grid; gap: 10px; width: 260px; }
+.second-factor h1 { margin: 0 0 8px; font-weight: 600; letter-spacing: 0.02em; }
+.second-factor p { margin: 0; }
 
 .app { display: grid; grid-template-columns: 230px 1fr; height: 100vh; }
 .sidebar {

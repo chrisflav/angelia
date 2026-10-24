@@ -3,14 +3,17 @@ import Angelia
 open Angelia Angelia.Server Std.Async
 
 def usage : String := "usage: angelia [serve | replay [--source NAME] | hash-password
-              | change-password] [--config PATH]
+              | change-password | reset-second-factors] [--config PATH]
 
   serve             run the server; the sources start at the first sign-in (default)
   replay            re-derive notifications from the stored raw events; reads the password
                     on stdin
   hash-password     read a password on stdin, print the passwordHash for the config
   change-password   read the old and the new password on stdin (one per line), re-encrypt the
-                    database key under the new one, print the new passwordHash"
+                    database key under the new one, print the new passwordHash
+  reset-second-factors
+                    read the password on stdin and remove every security key and
+                    authenticator app, for when all of them are lost"
 
 def flag (args : List String) (name : String) : Option String :=
   match args.dropWhile (· != name) with
@@ -55,7 +58,7 @@ def serve (config : Config) : IO Unit := do
   if config.passwordHash.isNone then
     log "main" "no passwordHash configured: the API will refuse every login"
   let ctx : AppContext := { config, db := ← Std.Mutex.new db, onUnlock := startSources config
-                            loginLock := ← Std.Mutex.new () }
+                            loginLock := ← Std.Mutex.new (), pending := ← IO.mkRef #[] }
   log "main" s!"listening on http://{config.host}:{config.port}; locked until the first sign-in"
   Async.block do
     let server ← Server.serve ctx
@@ -75,6 +78,13 @@ def main (args : List String) : IO UInt32 := do
     return (if failed == 0 then 0 else 1)
   | ["hash-password"] =>
     IO.println (← Vault.PasswordHash.create (← readLine)).toString
+    return 0
+  | ["reset-second-factors"] =>
+    let config ← loadConfig args
+    let db ← Db.connect config.dbPath
+    Db.migrate db
+    unlockFromStdin config db
+    IO.println s!"removed {← Db.deleteAllFactors db} second factor(s); signing in takes the password alone"
     return 0
   | ["change-password"] =>
     let config ← loadConfig args

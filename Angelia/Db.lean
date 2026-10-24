@@ -3,6 +3,7 @@ import Angelia.Model
 import Angelia.Rules
 import Angelia.Util
 import Angelia.Vault
+import Angelia.SecondFactor
 
 /-!
 # Storage
@@ -123,6 +124,22 @@ def schemaSql : String := "
     key TEXT NOT NULL,
     value BLOB NOT NULL,
     PRIMARY KEY (source, key)
+  );
+
+  -- What a sign-in needs besides the password. A security key's public key is not secret; an
+  -- authenticator app's shared secret is, and is sealed. `handle` is the WebAuthn credential id,
+  -- or a random id for an app.
+  CREATE TABLE IF NOT EXISTS second_factor (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind TEXT NOT NULL,
+    name TEXT NOT NULL,
+    handle TEXT NOT NULL UNIQUE,
+    public_key BLOB,
+    sign_count INTEGER NOT NULL DEFAULT 0,
+    secret BLOB,
+    last_step INTEGER NOT NULL DEFAULT 0,
+    created_at INTEGER NOT NULL,
+    last_used INTEGER
   );
 
   -- The data key, wrapped under a key derived from the login password.
@@ -552,6 +569,64 @@ def setSecret (db : Conn) (source key value : String) : IO Unit := do
   let sealed ← Vault.seal (← Vault.keys) (secretAad source key) value
   db exec!"INSERT INTO secret (source, key, value) VALUES ({source}, {key}, {sealed})
     ON CONFLICT (source, key) DO UPDATE SET value = excluded.value"
+
+/-! ## Second factors -/
+
+/-- Every second factor, without key material. -/
+def listFactors (db : Conn) : IO Json := do
+  let rows ← (← db query!"SELECT id, kind, name, created_at, last_used FROM second_factor
+    ORDER BY id" as (Int64 × String × String × Int64 × Option Int64)).toArray
+  return toJson (rows.map fun (id, kind, name, createdAt, lastUsed) =>
+    Json.mkObj [("id", id.toInt), ("kind", kind), ("name", name), ("createdAt", createdAt.toInt),
+      ("lastUsed", toJson (lastUsed.map Int64.toInt))])
+
+def webauthnCredentials (db : Conn) : IO (Array (Int × SecondFactor.Credential)) := do
+  let rows ← (← db query!"SELECT id, handle, public_key, sign_count FROM second_factor
+    WHERE kind = 'webauthn' ORDER BY id" as (Int64 × String × ByteArray × Int64)).toArray
+  return rows.map fun (id, handle, publicKey, count) =>
+    (id.toInt, { id := handle, publicKey, signCount := count.toNatClampNeg })
+
+private def totpAad (handle : String) : String := s!"totp\x00{handle}"
+
+/-- Every authenticator app's id, secret and last accepted step. -/
+def totpSecrets (db : Conn) : IO (Array (Int × ByteArray × Nat)) := do
+  let k ← Vault.keys
+  let rows ← (← db query!"SELECT id, handle, secret, last_step FROM second_factor
+    WHERE kind = 'totp' ORDER BY id" as (Int64 × String × ByteArray × Int64)).toArray
+  rows.mapM fun (id, handle, sealed, lastStep) => do
+    let hex ← Vault.open k (totpAad handle) sealed
+    return (id.toInt, Crypto.unhex hex, lastStep.toNatClampNeg)
+
+def addWebAuthn (db : Conn) (name : String) (c : SecondFactor.Credential) : IO Unit := do
+  let now ← nowSeconds
+  db exec!"INSERT INTO second_factor (kind, name, handle, public_key, sign_count, created_at)
+    VALUES ('webauthn', {name}, {c.id}, {c.publicKey}, {Int64.ofNat c.signCount}, {i64 now})"
+
+def addTotp (db : Conn) (name : String) (secret : ByteArray) : IO Unit := do
+  let now ← nowSeconds
+  let handle ← randomToken 16
+  let sealed ← Vault.seal (← Vault.keys) (totpAad handle) (Crypto.toHex secret)
+  db exec!"INSERT INTO second_factor (kind, name, handle, secret, created_at)
+    VALUES ('totp', {name}, {handle}, {sealed}, {i64 now})"
+
+/-- Record a successful use: the new signature counter or TOTP step, and when. -/
+def factorUsed (db : Conn) (id : Int) (signCount lastStep : Option Nat) : IO Unit := do
+  let now ← nowSeconds
+  let count := signCount.map Int64.ofNat
+  let step := lastStep.map Int64.ofNat
+  db exec!"UPDATE second_factor SET last_used = {i64 now},
+    sign_count = coalesce({count}, sign_count), last_step = coalesce({step}, last_step)
+    WHERE id = {i64 id}"
+
+def deleteFactor (db : Conn) (id : Int) : IO Bool := do
+  let rows ← (← db query!"DELETE FROM second_factor WHERE id = {i64 id} RETURNING id"
+    as Int64).toArray
+  pure !rows.isEmpty
+
+/-- Remove every second factor, for `angelia reset-second-factors`. -/
+def deleteAllFactors (db : Conn) : IO Nat := do
+  let rows ← (← db query!"DELETE FROM second_factor RETURNING id" as Int64).toArray
+  pure rows.size
 
 /-! ## Sessions -/
 

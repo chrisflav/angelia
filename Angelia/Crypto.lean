@@ -101,6 +101,17 @@ def toHex (bytes : ByteArray) : String := Id.run do
     s := (s.push hexChars[b.toNat >>> 4]!).push hexChars[b.toNat &&& 0xf]!
   return s
 
+/-- Bytes from hex; characters that are not hex digits count as zero. -/
+def unhex (s : String) : ByteArray := Id.run do
+  let digit (c : Char) : Nat :=
+    if c.isDigit then c.toNat - '0'.toNat
+    else if 'a' ≤ c.toLower && c.toLower ≤ 'f' then c.toLower.toNat - 'a'.toNat + 10 else 0
+  let cs := s.toList.toArray
+  let mut out := ByteArray.empty
+  for i in [0:cs.size / 2] do
+    out := out.push (digit cs[2 * i]! * 16 + digit cs[2 * i + 1]!).toUInt8
+  return out
+
 /-- Hex-encoded SHA-256 digest of a string (UTF-8). -/
 def sha256Hex (s : String) : String := toHex (sha256 s.toUTF8)
 
@@ -164,5 +175,46 @@ def pbkdf2Sha256 (password salt : ByteArray) (iterations : Nat) (dkLen : Nat := 
     out := out ++ wordBytes t
     i := i + 1
   return out.extract 0 dkLen
+
+/-! ## SHA-1
+
+Only for HMAC-SHA1 in TOTP (RFC 6238), which is what authenticator apps compute. HMAC does not
+rely on the collision resistance SHA-1 has lost. -/
+
+/-- The SHA-1 digest of `msg`, 20 bytes. -/
+def sha1 (msg : ByteArray) : ByteArray := Id.run do
+  let rotl (x : UInt32) (n : UInt32) : UInt32 := (x <<< n) ||| (x >>> (32 - n))
+  let data := pad msg
+  let mut h : Array UInt32 := #[0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0]
+  for c in [0:data.size / 64] do
+    let mut w := wordsAt data (c * 64) 16 ++ Array.replicate 64 0
+    for i in [16:80] do
+      w := w.set! i (rotl (w[i - 3]! ^^^ w[i - 8]! ^^^ w[i - 14]! ^^^ w[i - 16]!) 1)
+    let mut a := h[0]!
+    let mut b := h[1]!
+    let mut cc := h[2]!
+    let mut d := h[3]!
+    let mut e := h[4]!
+    for i in [0:80] do
+      let (f, k) : UInt32 × UInt32 :=
+        if i < 20 then ((b &&& cc) ||| ((~~~b) &&& d), 0x5a827999)
+        else if i < 40 then (b ^^^ cc ^^^ d, 0x6ed9eba1)
+        else if i < 60 then ((b &&& cc) ||| (b &&& d) ||| (cc &&& d), 0x8f1bbcdc)
+        else (b ^^^ cc ^^^ d, 0xca62c1d6)
+      let t := rotl a 5 + f + e + k + w[i]!
+      e := d; d := cc; cc := rotl b 30; b := a; a := t
+    h := #[h[0]! + a, h[1]! + b, h[2]! + cc, h[3]! + d, h[4]! + e]
+  return wordBytes h
+
+/-- HMAC-SHA1 (RFC 2104); SHA-1's block size is SHA-256's. -/
+def hmacSha1 (key msg : ByteArray) : ByteArray := Id.run do
+  let k := if key.size > blockSize then sha1 key else key
+  let mut inner := ByteArray.empty
+  let mut outer := ByteArray.empty
+  for i in [0:blockSize] do
+    let b := k[i]?.getD 0
+    inner := inner.push (b ^^^ 0x36)
+    outer := outer.push (b ^^^ 0x5c)
+  return sha1 (outer ++ sha1 (inner ++ msg))
 
 end Angelia.Crypto

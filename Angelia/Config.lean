@@ -39,6 +39,10 @@ structure Config where
   /-- Salted PBKDF2 hash of the login password, from `angelia hash-password`. Without it the API is
       refused entirely and the server never unlocks. -/
   passwordHash : Option String := none
+  /-- The address browsers reach the server at, e.g. `https://angelia.merten.dev`. Security keys
+      sign for this origin and its host name, so it has to be exact. Defaults to
+      `http://localhost:<port>`. -/
+  origin : Option String := none
   /-- Mark the session cookie `Secure`; set this whenever the server is behind HTTPS. -/
   secureCookies : Bool := false
   /-- Session lifetime, in days since last use. -/
@@ -63,9 +67,13 @@ instance : FromJson Config where
       staticDir := (← opt "staticDir" d.staticDir.toString : String)
       -- Empty counts as unset, so an unfilled secret leaves the server refusing logins.
       passwordHash := (← opt "passwordHash" none).filter (!·.isEmpty)
+      origin := ← opt "origin" none
       secureCookies := ← opt "secureCookies" d.secureCookies
       sessionDays := ← opt "sessionDays" d.sessionDays
       sources := ← opt "sources" #[] }
+
+def Config.publicOrigin (c : Config) : String :=
+  (c.origin.getD s!"http://localhost:{c.port}").dropEndWhile (· == '/') |>.toString
 
 def Config.load (path : System.FilePath) : IO Config := do
   let text ← IO.FS.readFile path
