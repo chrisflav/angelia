@@ -123,8 +123,38 @@ a { color: var(--accent); }
 .detail .labels { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
 .detail .labels label { display: inline-flex; gap: 4px; align-items: center; font-size: 12px; }
 .detail .body {
-  white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.5;
+  overflow-wrap: anywhere; line-height: 1.5;
   background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px;
+}
+.body p, .body ul, .body ol, .body pre, .body table { margin: 0 0 0.75em; }
+.body > :last-child, .body blockquote > :last-child { margin-bottom: 0; }
+.body ul, .body ol { padding-left: 1.5em; }
+.body li.nested { margin-left: 1.5em; }
+.body code { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.92em;
+  background: var(--bg); border-radius: 3px; padding: 0 3px; }
+.body pre { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+  overflow-x: auto; white-space: pre; }
+.body pre code { background: none; padding: 0; }
+.body hr { border: 0; border-top: 1px solid var(--line); margin: 1em 0; }
+.body table { border-collapse: collapse; }
+.body th, .body td { border: 1px solid var(--line); padding: 3px 8px; text-align: left; }
+.body .md-h { font-weight: 600; }
+.body .md-h1 { font-size: 1.25em; }
+.body .md-h2 { font-size: 1.12em; }
+/* Quote levels in the colours a mail client uses, cycling after four. */
+.body blockquote.quote { margin: 0 0 0.75em; padding: 2px 0 2px 12px; border-left: 3px solid var(--q); color: var(--qink); }
+.body .q1 { --q: #729fcf; --qink: #33557a; }
+.body .q2 { --q: #ad7fa8; --qink: #6a3f65; }
+.body .q3 { --q: #73b44a; --qink: #3f6a24; }
+.body .q4 { --q: #e09a3e; --qink: #7a521c; }
+.body .attribution { color: var(--muted); margin: 0.75em 0 0.3em; }
+.body .signature { color: #9a9ca3; font-size: 13px; margin-top: 1em; }
+@media (prefers-color-scheme: dark) {
+  .body .q1 { --qink: #a9c4e4; }
+  .body .q2 { --qink: #d2b3ce; }
+  .body .q3 { --qink: #b0d897; }
+  .body .q4 { --qink: #efc690; }
+  .body .signature { color: #7d8088; }
 }
 .detail table { border-collapse: collapse; width: 100%; }
 .detail td, .detail th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }

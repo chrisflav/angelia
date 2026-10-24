@@ -25,7 +25,7 @@ function h(tag, attrs, ...children) {
     else if (k === "style") Object.assign(el.style, v);
     else el.setAttribute(k, v === true ? "" : v);
   }
-  for (const c of children.flat()) {
+  for (const c of children.flat(Infinity)) {
     if (c === null || c === undefined || c === false) continue;
     el.append(c instanceof Node ? c : document.createTextNode(String(c)));
   }
@@ -35,7 +35,7 @@ function h(tag, attrs, ...children) {
 /** Replace an element's children like `replaceChildren`, but skipping null, undefined and false
     as `h` does -- the DOM's own method would print them as text. */
 function fill(el, ...children) {
-  el.replaceChildren(...children.flat().filter((c) => c !== null && c !== undefined && c !== false)
+  el.replaceChildren(...children.flat(Infinity).filter((c) => c !== null && c !== undefined && c !== false)
     .map((c) => c instanceof Node ? c : document.createTextNode(String(c))));
   return el;
 }
@@ -328,7 +328,7 @@ function renderList() {
     h("span", { class: "who" }, h("span", { class: "source-tag" }, n.source), n.author),
     h("span", { class: "when" }, (n.starred ? "★ " : "") + when(n.time)),
     h("span", { class: "title" }, n.title, labelChips(n)),
-    h("span", { class: "snippet" }, n.body.replace(/\[([^\]\n]*)\]\([^)\s]*\)/g, "$1").slice(0, 200)));
+    h("span", { class: "snippet" }, snippet(n.body)));
   });
   if (state.next) rows.push(h("button", { class: "more", onclick: loadMore }, "Load more"));
   fill(list, ...rows);
@@ -384,23 +384,188 @@ function renderDetail() {
         h("input", { type: "checkbox", checked: n.labels.includes(l.id),
           onchange: (e) => toggleLabel(l, e.target.checked) }),
         h("span", { class: "chip", style: { background: l.color } }, l.name)))) : null,
-    h("div", { class: "body" }, n.body ? linkify(n.body) : "(no text)"));
+    h("div", { class: "body" }, n.body.trim() ? renderMessage(n.body) : h("p", { class: "hint" }, "No text.")));
 }
 
-/** Plain text with its links clickable: `[text](url)` (how links in HTML mail are kept) shows
-    as the text, a bare URL as itself. Only http(s) and mailto become links. */
-function linkify(text) {
-  const link = /\[([^\]\n]{1,500})\]\(((?:https?:\/\/|mailto:)[^\s)]+)\)|(https?:\/\/[^\s<>"'`]*[^\s<>"'`.,;:!?)\]])/g;
+/* ---------- message bodies ---------- */
+
+/** The text for the list's preview line: no quoted lines, code blocks or Markdown markup. */
+function snippet(text) {
+  let fenced = false;
+  return text.split("\n").filter((l) => {
+    if (FENCE.test(l)) { fenced = !fenced; return false; }
+    return !fenced && l.trim() && !QUOTED.test(l) && !RULE.test(l) && !TABLE_SEP.test(l);
+  }).join(" ")
+    .replace(/!?\[([^\]\n]*)\]\([^)\s]*\)/g, "$1")
+    .replace(/(^|\s)(#{1,6}|[-*+]|\d{1,3}[.)])\s+/g, "$1")
+    .replace(/[`*~|]|(?<![\w])_|_(?![\w])/g, "")
+    .replace(/\s+/g, " ").slice(0, 200);
+}
+
+// Rendered the way a mail client does: quoted earlier messages indented behind a bar coloured by
+// quote level, the signature greyed out, and Markdown formatting. All of it is built as DOM
+// nodes from text; nothing in a message is ever interpreted as HTML.
+
+function linkTo(href, text) {
+  return h("a", { href, target: "_blank", rel: "noopener noreferrer nofollow" }, text);
+}
+
+// Emphasis only around whole words, so snake_case names, file paths and URLs stay as they are.
+const INLINE = new RegExp([
+  "`(?<code>[^`\\n]+)`",
+  "!?\\[(?<label>[^\\]\\n]{1,500})\\]\\((?<href>(?:https?:\\/\\/|mailto:)[^\\s)]+)\\)",
+  "(?<url>https?:\\/\\/[^\\s<>\"'`]*[^\\s<>\"'`.,;:!?)\\]])",
+  "(?<![\\w*])\\*\\*(?=\\S)(?<b1>.+?)(?<=\\S)\\*\\*(?![\\w*])",
+  "(?<![\\w_])__(?=\\S)(?<b2>.+?)(?<=\\S)__(?![\\w_])",
+  "(?<![\\w*])\\*(?=[^\\s*])(?<i1>[^*\\n]+?)(?<=[^\\s*])\\*(?![\\w*])",
+  "(?<![\\w_])_(?=[^\\s_])(?<i2>[^_\\n]+?)(?<=[^\\s_])_(?![\\w_])",
+  "~~(?=\\S)(?<s>[^~\\n]+?)(?<=\\S)~~",
+].join("|"), "g");
+
+function inline(text) {
   const out = [];
   let last = 0;
-  for (const m of text.matchAll(link)) {
+  for (const m of text.matchAll(INLINE)) {
     out.push(text.slice(last, m.index));
-    const href = m[2] || m[3];
-    out.push(h("a", { href, target: "_blank", rel: "noopener noreferrer nofollow" }, m[1] || m[3]));
+    const g = m.groups;
+    if (g.code !== undefined) out.push(h("code", {}, g.code));
+    else if (g.href !== undefined) out.push(linkTo(g.href, g.label));
+    else if (g.url !== undefined) out.push(linkTo(g.url, g.url));
+    else if (g.b1 !== undefined || g.b2 !== undefined) out.push(h("strong", {}, inline(g.b1 ?? g.b2)));
+    else if (g.i1 !== undefined || g.i2 !== undefined) out.push(h("em", {}, inline(g.i1 ?? g.i2)));
+    else if (g.s !== undefined) out.push(h("s", {}, inline(g.s)));
     last = m.index + m[0].length;
   }
   out.push(text.slice(last));
   return out;
+}
+
+const FENCE = /^\s*(```|~~~)/;
+const HEADING = /^\s*(#{1,6})\s+(.*?)\s*#*\s*$/;
+const RULE = /^\s*([-*_])(\s*\1){2,}\s*$/;
+const ITEM = /^(\s*)([-*+]|\d{1,3}[.)])\s+(.*)$/;
+const TABLE_SEP = /^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$/;
+const startsBlock = (l) => FENCE.test(l) || HEADING.test(l) || RULE.test(l) || ITEM.test(l);
+
+function cells(row) {
+  return row.trim().replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+}
+
+/** Markdown blocks of unquoted lines. A line break inside a paragraph is kept, as mail and
+    GitHub comments both mean it. */
+function blocks(lines) {
+  const out = [];
+  for (let i = 0; i < lines.length;) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+    if (FENCE.test(line)) {
+      const fence = line.trim().slice(0, 3);
+      const code = [];
+      for (i++; i < lines.length && !lines[i].trim().startsWith(fence); i++) code.push(lines[i]);
+      out.push(h("pre", {}, h("code", {}, code.join("\n"))));
+      i++;
+      continue;
+    }
+    const heading = line.match(HEADING);
+    if (heading) {
+      out.push(h("p", { class: "md-h md-h" + Math.min(heading[1].length, 3) }, inline(heading[2])));
+      i++;
+      continue;
+    }
+    if (RULE.test(line)) { out.push(h("hr")); i++; continue; }
+    if (line.includes("|") && i + 1 < lines.length && TABLE_SEP.test(lines[i + 1])) {
+      const head = cells(line);
+      const rows = [];
+      for (i += 2; i < lines.length && lines[i].includes("|") && lines[i].trim(); i++) rows.push(cells(lines[i]));
+      out.push(h("table", {}, h("thead", {}, h("tr", {}, head.map((c) => h("th", {}, inline(c))))),
+        h("tbody", {}, rows.map((r) => h("tr", {}, head.map((_, k) => h("td", {}, inline(r[k] || ""))))))));
+      continue;
+    }
+    const item = line.match(ITEM);
+    if (item) {
+      const ordered = /\d/.test(item[2]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(ITEM);
+        if (m && /\d/.test(m[2]) === ordered) { items.push({ depth: m[1].length >= 2 ? 1 : 0, text: [m[3]] }); i++; }
+        else if (lines[i].trim() && /^\s{2,}/.test(lines[i]) && items.length) { items.at(-1).text.push(lines[i].trim()); i++; }
+        else break;
+      }
+      out.push(h(ordered ? "ol" : "ul", {}, items.map((it) =>
+        h("li", { class: it.depth ? "nested" : null }, it.text.map((t, k) => [k ? h("br") : null, inline(t)])))));
+      continue;
+    }
+    const para = [];
+    for (; i < lines.length && lines[i].trim() && (!para.length || !startsBlock(lines[i])); i++) para.push(lines[i]);
+    out.push(h("p", {}, para.map((l, k) => [k ? h("br") : null, inline(l)])));
+  }
+  return out;
+}
+
+// "On Thu, 23 Oct 2026 Anna wrote:", "Am ... schrieb ...:", "Op ... schreef ...:"
+const ATTRIBUTION = /^(on|am|op|le|el)\b.{0,250}(wrote|schrieb|schreef|a écrit|escribió)\s*:\s*$/i;
+// Outlook's header above an earlier message, which it does not mark with ">".
+const OUTLOOK_FROM = /^\*?(from|von|van|de)\s*:\*?\s/i;
+const OUTLOOK_SENT = /^\*?(sent|gesendet|verzonden|date|datum|envoyé)\s*:/i;
+const ORIGINAL = /^-{2,}\s*(original message|ursprüngliche nachricht|oorspronkelijk bericht)\s*-{2,}$/i;
+const SEPARATOR = /^(-- ?|---|—)$/;
+const QUOTED = /^\s*>/;
+
+/** Lines quoted one level deeper below `lines`, plus the attribution above them. */
+function quoteTree(lines, level) {
+  const out = [];
+  for (let i = 0; i < lines.length;) {
+    if (QUOTED.test(lines[i])) {
+      const inner = [];
+      // Blank lines between quoted ones belong to the quote.
+      for (; i < lines.length && (QUOTED.test(lines[i]) || (!lines[i].trim() && QUOTED.test(lines[i + 1] || ""))); i++)
+        inner.push(lines[i].replace(/^\s*>\s?/, ""));
+      const q = (level % 4) + 1;
+      out.push(h("blockquote", { class: "quote q" + q }, quoteTree(inner, level + 1)));
+      continue;
+    }
+    const plain = [];
+    for (; i < lines.length && !QUOTED.test(lines[i]); i++) plain.push(lines[i]);
+    // The line introducing a quote goes with it, set apart from the text.
+    let attribution = null;
+    if (i < lines.length) {
+      let k = plain.length - 1;
+      while (k >= 0 && !plain[k].trim()) k--;
+      if (k >= 0 && (ATTRIBUTION.test(plain[k].trim()) || /\b(wrote|schrieb|schreef)\s*:\s*$/i.test(plain[k]))) {
+        attribution = plain[k].trim();
+        plain.length = k;
+      }
+    }
+    out.push(blocks(plain));
+    if (attribution) out.push(h("p", { class: "attribution" }, inline(attribution)));
+  }
+  return out;
+}
+
+function renderMessage(text) {
+  let lines = text.replace(/\r\n?/g, "\n").split("\n");
+  // Outlook's earlier messages are quoted in all but the ">".
+  const earlier = lines.findIndex((l, i) => i > 0 && (ORIGINAL.test(l.trim()) ||
+    (OUTLOOK_FROM.test(l.trim()) && lines.slice(i + 1, i + 6).some((n) => OUTLOOK_SENT.test(n.trim())))));
+  if (earlier > 0) lines = [...lines.slice(0, earlier), ...lines.slice(earlier).map((l) => "> " + l)];
+  // The signature: after the last separator line, if what follows is short and quotes nothing.
+  let signature = null;
+  for (let i = lines.length - 1; i > 0; i--) {
+    if (QUOTED.test(lines[i])) break;
+    if (SEPARATOR.test(lines[i].trimEnd()) || lines[i] === "-- ") {
+      const rest = lines.slice(i + 1);
+      const filled = rest.filter((l) => l.trim()).length;
+      const tail = lines.slice(rest.length + i + 1);
+      if (filled >= 1 && filled <= 12 && !tail.length) {
+        signature = rest.join("\n").trim();
+        lines = lines.slice(0, i);
+      }
+      break;
+    }
+  }
+  return [quoteTree(lines, 0),
+    signature && h("div", { class: "signature" }, "-- ", h("br"),
+      signature.split("\n").map((l, k) => [k ? h("br") : null, inline(l)]))];
 }
 
 /* ---------- rules ---------- */
