@@ -309,10 +309,15 @@ structure Filter where
   limit : Nat := 100
 deriving Inhabited
 
+/-- The scope's time limit as an SQL argument, evaluated now: a window moves with the clock. -/
+private def scopeMinTime (scope : Scope) : IO (Option Int64) := do
+  return (scope.minTime (← nowSeconds)).map Int64.ofInt
+
 /-- One page of a notification query without the text search, in the filter's sort order. -/
 private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
     IO (Array NotificationRow) := do
   let (srcs, lbls) := scope.sqlArgs
+  let minT ← scopeMinTime scope
   let label := f.label.map i64
   let bt := f.before.map (i64 ·.1)
   let bid := f.before.map (i64 ·.2)
@@ -330,6 +335,8 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
             WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT})
       AND CASE {f.state}
         WHEN 'inbox' THEN n.archived = 0
         WHEN 'unread' THEN n.archived = 0 AND n.read = 0
@@ -367,6 +374,7 @@ def listNotifications (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notif
 /-- A notification, if it exists and is visible under `scope`. -/
 def getNotification (db : Conn) (scope : Scope) (id : Int) : IO (Option Notification) := do
   let (srcs, lbls) := scope.sqlArgs
+  let minT ← scopeMinTime scope
   let rows ← (← db query!"SELECT n.id, n.source, n.external_id, n.kind, n.thread_key, n.content,
       n.sent_at, n.received_at, n.read, n.archived, n.starred,
       (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id),
@@ -375,18 +383,23 @@ def getNotification (db : Conn) (scope : Scope) (id : Int) : IO (Option Notifica
     FROM notification n WHERE n.id = {i64 id}
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
-            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))" as NotificationRow).toArray
+            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT})" as NotificationRow).toArray
   rows[0]?.mapM (·.toNotification (← Vault.keys))
 
 /-- Whether any of these notifications is visible under `scope`. -/
 def anyVisible (db : Conn) (scope : Scope) (ids : Array Int) : IO Bool := do
   let (srcs, lbls) := scope.sqlArgs
+  let minT ← scopeMinTime scope
   let idList := (toJson ids).compress
   let rows ← (← db query!"SELECT 1 FROM notification n
     WHERE n.id IN (SELECT value FROM json_each({idList}))
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
             WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT})
     LIMIT 1" as Int64).toArray
   pure !rows.isEmpty
 
@@ -401,8 +414,9 @@ def rawPayload (db : Conn) (id : Int) : IO (Option Json) := do
 /-- Set the user-state flags given; absent ones are unchanged. Notifications outside `scope` are
     left alone. Returns the ids of those changed. -/
 def setFlags (db : Conn) (scope : Scope) (ids : Array Int) (read archived starred : Option Bool) :
-    IO (Array Int) :=
+    IO (Array Int) := do
   let (srcs, lbls) := scope.sqlArgs
+  let minT ← scopeMinTime scope
   withTransaction db do
     let mut changed := #[]
     for id in ids do
@@ -411,7 +425,9 @@ def setFlags (db : Conn) (scope : Scope) (ids : Array Int) (read archived starre
         WHERE id IN (SELECT n.id FROM notification n WHERE n.id = {i64 id}
           AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
           AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
-            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls})))))
+            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT}))
         RETURNING id" as Int64).toArray
       changed := changed ++ rows.map (·.toInt)
     return changed
@@ -419,10 +435,13 @@ def setFlags (db : Conn) (scope : Scope) (ids : Array Int) (read archived starre
 /-- Unread count per source and per label, for the sidebar, counting only what `scope` sees. -/
 def counts (db : Conn) (scope : Scope) : IO Json := do
   let (srcs, lbls) := scope.sqlArgs
+  let minT ← scopeMinTime scope
   let bySource ← (← db query!"SELECT n.source, count(*) FROM notification n
     WHERE n.archived = 0 AND n.read = 0 AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
-            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls})))) GROUP BY n.source"
+            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT}) GROUP BY n.source"
     as (String × Int64)).toArray
   let byLabel ← (← db query!"SELECT l.label_id, count(*) FROM notification_label l
     JOIN notification n ON n.id = l.notification_id WHERE n.archived = 0 AND n.read = 0
@@ -430,11 +449,15 @@ def counts (db : Conn) (scope : Scope) : IO Json := do
       AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
             WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT})
     GROUP BY l.label_id" as (Int64 × Int64)).toArray
   let total ← (← db query!"SELECT count(*) FROM notification n
     WHERE n.archived = 0 AND n.read = 0 AND ({srcs} IS NULL OR n.source IN (SELECT value FROM json_each({srcs})))
       AND ({lbls} IS NULL OR EXISTS (SELECT 1 FROM notification_label sl
-            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))" as Int64).toArray
+            WHERE sl.notification_id = n.id AND sl.label_id IN (SELECT value FROM json_each({lbls}))))
+      AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
+        THEN n.received_at ELSE n.sent_at END) >= {minT})" as Int64).toArray
   return Json.mkObj [
     ("unread", total[0]!.toInt),
     ("sources", Json.mkObj (bySource.toList.map fun (s, c) => (s, toJson c.toInt))),

@@ -313,6 +313,10 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--line); borde
 .choices { display: flex; flex-wrap: wrap; gap: 6px 18px; }
 .choices.sub { margin-top: 6px; padding-left: 22px; }
 .choices label, label.check { display: inline-flex; align-items: center; gap: 6px; }
+.time-choices { display: flex; flex-direction: column; gap: 6px; }
+.time-choices label { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.form-field .time-choices input.narrow[type="number"] { width: 5em; }
+.form-field .time-choices input.date[type="date"] { width: auto; }
 
 .form-row { display: grid; grid-template-columns: 9rem 1fr; gap: 4px 12px; align-items: baseline; }
 .form-label { color: var(--muted); padding-top: 4px; }

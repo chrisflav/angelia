@@ -812,25 +812,64 @@ function subsetPicker(name, options, picked) {
   return h("div", {}, h("div", { class: "choices" }, h("label", {}, all, "All"), h("label", {}, some, "Only these")), list);
 }
 
+/** "7 days", "36 hours": a window in seconds, in the unit it was given in. */
+function span(seconds) {
+  const [n, unit] = seconds % 86400 === 0 ? [seconds / 86400, "day"] : [Math.round(seconds / 3600), "hour"];
+  return `${n} ${unit}${n === 1 ? "" : "s"}`;
+}
+
 function describeScope(scope) {
   const byId = Object.fromEntries(state.labels.map((l) => [l.id, l.name]));
   const sources = scope.sources ? scope.sources.join(", ") || "no sources" : "all sources";
   const labels = scope.labels ? "labelled " + (scope.labels.map((id) => byId[id] || "#" + id).join(" or ") || "nothing") : "";
-  return [`Sees ${sources}${labels ? ", " + labels : ""}.`, scope.write ? "May mark read, archive, star and label." : "Read-only."];
+  const time = [scope.since && `from ${when(scope.since)} on`, scope.within && `from the past ${span(scope.within)}`]
+    .filter(Boolean).join(" and ");
+  return [`Sees ${sources}${labels ? ", " + labels : ""}${time ? ", " + time : ""}.`,
+    scope.write ? "May mark read, archive, star and label." : "Read-only."];
+}
+
+/** Any time, since a date, or a moving window of hours or days. */
+function timePicker(picked) {
+  const any = h("input", { type: "radio", name: "t-time", checked: true });
+  const sinceOn = h("input", { type: "radio", name: "t-time" });
+  const windowOn = h("input", { type: "radio", name: "t-time" });
+  const date = h("input", { type: "date", class: "date", "aria-label": "Since", value: new Date().toISOString().slice(0, 10),
+    onfocus: () => { sinceOn.checked = true; } });
+  const amount = h("input", { type: "number", min: 1, value: 7, "aria-label": "How many", class: "narrow",
+    onfocus: () => { windowOn.checked = true; } });
+  const unit = h("select", { "aria-label": "Unit", onfocus: () => { windowOn.checked = true; } },
+    h("option", { value: "86400" }, "days"), h("option", { value: "3600" }, "hours"));
+  picked.get = () => {
+    if (sinceOn.checked) {
+      if (!date.value) throw new Error("Choose the date the token sees notifications from.");
+      // Midnight at the start of that day, here.
+      return { since: Math.floor(new Date(date.value + "T00:00").getTime() / 1000) };
+    }
+    if (windowOn.checked) {
+      const n = Number(amount.value);
+      if (!(n >= 1)) throw new Error("The window needs at least 1 hour or day.");
+      return { within: Math.round(n) * Number(unit.value) };
+    }
+    return {};
+  };
+  return h("div", { class: "time-choices" },
+    h("label", {}, any, "Any time"),
+    h("label", {}, sinceOn, "Since", date),
+    h("label", {}, windowOn, "From the past", amount, unit));
 }
 
 async function tokensPage(created) {
   const tokens = await api("GET", "tokens");
   const newToken = () => openDialog("New API token", (close) => {
     const name = h("input", { placeholder: "e.g. phone" });
-    const sources = {}, labels = {};
+    const sources = {}, labels = {}, time = {};
     const write = h("input", { type: "checkbox" });
     const error = h("p", { class: "error", role: "alert" });
     const create = async () => {
       if (!name.value.trim()) { error.textContent = "Give the token a name."; return; }
       try {
         const t = await api("POST", "tokens", { name: name.value.trim(),
-          scope: { sources: sources.get(), labels: labels.get(), write: write.checked } });
+          scope: { sources: sources.get(), labels: labels.get(), write: write.checked, ...time.get() } });
         close();
         showSettings("tokens", t);
       } catch (err) { error.textContent = err.message; }
@@ -839,6 +878,7 @@ async function tokensPage(created) {
       row("Name", name),
       row("Sources", subsetPicker("t-sources", state.sources.configured.map((x) => [x.name, x.name]), sources)),
       row("Labels", subsetPicker("t-labels", state.labels.map((l) => [l.id, l.name]), labels)),
+      row("Time", timePicker(time), "By when a notification was sent. A window moves: older ones drop out."),
       row("Changes", h("label", { class: "check" }, write, "May mark read, archive, star and label")),
       error,
       h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),

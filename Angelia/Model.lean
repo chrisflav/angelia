@@ -97,12 +97,20 @@ deriving Inhabited, ToJson, FromJson
 
     Label scopes follow the rules: a token scoped to label "Uni" sees whatever the rules (or the
     user) label "Uni", including notifications labelled later, and stops seeing one whose label is
-    removed. -/
+    removed.
+
+    A scope can also be limited in time, by its notifications' time (when they were sent, or
+    when they arrived if that is unknown or earlier): `since` a fixed point, or `within` a
+    moving window back from now. With both, the later of the two applies. -/
 structure Scope where
   sources : Option (Array String) := none
   labels : Option (Array Int) := none
   /-- Whether the token may change notifications (read/archived/starred, labels in scope). -/
   write : Bool := false
+  /-- Only notifications from this time on (Unix seconds). -/
+  since : Option Int := none
+  /-- Only notifications from the past this many seconds. -/
+  within : Option Nat := none
 deriving Inhabited, Repr, BEq, ToJson
 
 instance : FromJson Scope where
@@ -111,8 +119,10 @@ instance : FromJson Scope where
       match j.getObjVal? k with
       | .ok .null | .error _ => pure none
       | .ok v => some <$> fromJson? v
+    let within : Option Nat ← opt "within"
+    if within == some 0 then throw "'within' must be positive"
     return { sources := ← opt "sources", labels := ← opt "labels"
-             write := (← opt "write").getD false }
+             write := (← opt "write").getD false, since := ← opt "since", within }
 
 /-- The scope of a logged-in session. -/
 def Scope.full : Scope := { write := true }
@@ -120,6 +130,12 @@ def Scope.full : Scope := { write := true }
 /-- The scope parameters as SQL arguments: JSON arrays for `json_each`, or `NULL`. -/
 def Scope.sqlArgs (s : Scope) : Option String × Option String :=
   (s.sources.map (toJson · |>.compress), s.labels.map (toJson · |>.compress))
+
+/-- The earliest notification time visible at `now`, if the scope is limited in time. -/
+def Scope.minTime (s : Scope) (now : Int) : Option Int :=
+  match s.since, s.within.map (now - ·) with
+  | some a, some b => some (max a b)
+  | a, b => a.orElse fun _ => b
 
 /-- Whether a label may be read or changed under this scope. -/
 def Scope.allowsLabel (s : Scope) (label : Int) : Bool :=

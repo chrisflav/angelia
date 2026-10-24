@@ -188,6 +188,14 @@ def scopeTests (s : Suite) : IO Unit := do
   s.check "refuses other source" (!sc.allowsSource "github")
   s.check "empty source list sees nothing" (!({ sources := some #[] } : Scope).allowsSource "mail")
   s.eq "scope json roundtrip" (parse (toJson sc).compress) (some sc)
+  let timed : Scope := { since := some 1000, within := some 3600 }
+  s.eq "time scope json roundtrip" (parse (toJson timed).compress) (some timed)
+  s.eq "no time limit" (({} : Scope).minTime 10000) none
+  s.eq "since only" (({ since := some 1000 } : Scope).minTime 10000) (some 1000)
+  s.eq "within only" (({ within := some 3600 } : Scope).minTime 10000) (some 6400)
+  s.eq "both: the later wins" (timed.minTime 10000) (some 6400)
+  s.eq "both: the later wins, other way" (timed.minTime 4000) (some 1000)
+  s.eq "a zero window is refused" (parse "{\"within\":0}") none
 
 def cryptoTests (s : Suite) : IO Unit := do
   IO.println "crypto"
