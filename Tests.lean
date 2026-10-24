@@ -1,0 +1,256 @@
+import Angelia
+
+/-!
+# Tests
+
+Pure-function tests over recorded or hand-written protocol data. `lake test` runs them.
+-/
+
+open Lean Angelia Angelia.Mail Angelia.Imap
+
+structure Suite where
+  failures : IO.Ref (Array String)
+
+def Suite.check (s : Suite) (name : String) (cond : Bool) (detail : String := "") : IO Unit := do
+  if cond then IO.println s!"  ok  {name}"
+  else
+    IO.println s!"  FAIL {name} {detail}"
+    s.failures.modify (·.push name)
+
+def Suite.eq [BEq α] [Repr α] (s : Suite) (name : String) (actual expected : α) : IO Unit :=
+  s.check name (actual == expected) s!"\n    expected {repr expected}\n    actual   {repr actual}"
+
+/-- Lines joined with CRLF, as on the wire. -/
+def crlf (lines : List String) : String := "\r\n".intercalate lines
+
+def multipartMail : String := crlf [
+  "From: =?UTF-8?B?SsO8cmdlbiBNw7xsbGVy?= <jm@example.org>",
+  "To: me@example.org",
+  "Subject: =?ISO-8859-1?Q?Gr=FC=DFe?= =?ISO-8859-1?Q?_aus_K=F6ln?=",
+  "Date: Tue, 20 Oct 2026 14:03:07 +0200",
+  "Message-ID: <abc@example.org>",
+  "References: <root@example.org> <mid@example.org>",
+  "MIME-Version: 1.0",
+  "Content-Type: multipart/alternative;",
+  " boundary=\"XYZ\"",
+  "",
+  "preamble",
+  "--XYZ",
+  "Content-Type: text/plain; charset=utf-8",
+  "Content-Transfer-Encoding: quoted-printable",
+  "",
+  "Hallo Welt, sch=C3=B6n =",
+  "hier.",
+  "--XYZ",
+  "Content-Type: text/html; charset=utf-8",
+  "",
+  "<p>Hallo</p>",
+  "--XYZ--",
+  "epilogue"]
+
+def htmlMail : String := crlf [
+  "From: Shop <noreply@shop.example>",
+  "Subject: Your order",
+  "Content-Type: text/html; charset=windows-1252",
+  "Content-Transfer-Encoding: base64",
+  "",
+  "PGh0bWw+PHN0eWxlPnB7Y29sb3I6cmVkfTwvc3R5bGU+PHA+T3JkZXIgJmFtcDsgc2hpcHBpbmc8",
+  "L3A+PHA+NSAmZXVybzsgY2hhcmdlZCCAPC9wPjwvaHRtbD4="]
+
+def mimeTests (s : Suite) : IO Unit := do
+  IO.println "mime"
+  let m := parseMessage multipartMail
+  s.eq "encoded-word from" m.from "Jürgen Müller <jm@example.org>"
+  s.eq "adjacent encoded words joined" m.subject "Grüße aus Köln"
+  s.eq "display name" (displayName m.from) "Jürgen Müller"
+  s.eq "message id" m.messageId (some "abc@example.org")
+  s.eq "thread key is the references root" m.threadKey (some "root@example.org")
+  s.eq "date with offset" m.date (some 1792497787)
+  s.eq "plain part preferred, QP soft breaks" m.text "Hallo Welt, schön hier."
+  let h := parseMessage htmlMail
+  s.eq "html fallback, base64, cp1252" h.text "Order & shipping\n\n5 € charged €"
+  s.eq "thread key falls back to nothing" h.threadKey none
+  s.eq "date without day name" (parseDate "1 Jan 2026 00:00:00 +0000") (some 1767225600)
+  s.eq "two-digit year" (parseDate "Mon, 3 Feb 99 10:00 GMT") (some 918036000)
+  s.eq "iso8601" (parseIso8601 "2026-10-20T12:34:56Z") (some 1792499696)
+  s.eq "iso8601 offset" (parseIso8601 "2026-10-20T14:34:56+02:00") (some 1792499696)
+  s.eq "plain header passes through" (decodeHeader "plain = text") "plain = text"
+  s.eq "raw utf-8 header" (decodeHeader (latin1 "Café".toUTF8)) "Café"
+
+def imapTests (s : Suite) : IO Unit := do
+  IO.println "imap"
+  let body := crlf ["Subject: hi", "", "x"]
+  let fetchResp : Response := #[
+    .text s!"* 12 FETCH (UID 4827 FLAGS (\\Seen \\Answered) INTERNALDATE \"17-Jul-2026 02:44:25 -0700\" BODY[]<0> \{{body.length}}",
+    .literal body,
+    .text ")"]
+  match fetchResp.fetch? with
+  | none => s.check "fetch parses" false
+  | some f =>
+    s.eq "fetch seq" f.seq 12
+    s.eq "fetch uid" f.uid (some 4827)
+    s.eq "fetch flags" f.flags #["\\Seen", "\\Answered"]
+    s.eq "fetch body literal" f.body (some body)
+    s.eq "fetch internaldate" f.internalDate (some "17-Jul-2026 02:44:25 -0700")
+  s.eq "literal size" (literalSize? "* 1 FETCH (BODY[] {123}") (some 123)
+  s.eq "literal+ size" (literalSize? "a LOGIN {5+}") (some 5)
+  s.eq "no literal" (literalSize? "* OK done") none
+  let ok : Response := #[.text "* OK [UIDVALIDITY 3857529045] UIDs valid"]
+  s.eq "uidvalidity code" (ok.codeNat? "UIDVALIDITY") (some 3857529045)
+  s.eq "exists" (Response.exists? #[.text "* 172 EXISTS"]) (some 172)
+  s.eq "tagged" (Response.tagged? #[.text "h3 NO [AUTHENTICATIONFAILED] bad"])
+    (some ("h3", "NO", "[AUTHENTICATIONFAILED] bad"))
+  s.eq "capabilities" (Response.capabilities? #[.text "* OK [CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN] hi"])
+    (some ["IMAP4REV1", "IDLE", "AUTH=PLAIN"])
+  s.eq "bracketed atom stays whole"
+    (parseValues #[.text "BODY[HEADER.FIELDS (FROM TO)] NIL \"a\\\"b\""])
+    #[.atom "BODY[HEADER.FIELDS (FROM TO)]", .nil, .str "a\"b"]
+  s.eq "quote escapes" (quote "a\"b\\c").toOption (some "\"a\\\"b\\\\c\"")
+  s.eq "sasl plain" (saslPlain "user" "pass") "AHVzZXIAcGFzcw=="
+  s.eq "sasl xoauth2" (saslXOAuth2 "u@x.org" "tok") "dXNlcj11QHgub3JnAWF1dGg9QmVhcmVyIHRvawEB"
+  s.eq "mailbox utf-7" (encodeMailbox "Entwürfe") "Entw&APw-rfe"
+  s.eq "mailbox ampersand" (encodeMailbox "A&B") "A&-B"
+  match Connector.ImapSource.normalize (Json.mkObj [("raw", multipartMail),
+      ("flags", toJson #["\\Seen"])]) with
+  | .ok n =>
+    s.eq "imap normalize title" n.title "Grüße aus Köln"
+    s.eq "imap normalize read from \\Seen" n.read true
+    s.eq "imap normalize author" n.author "Jürgen Müller"
+  | .error e => s.check "imap normalize" false e
+
+def githubThread : String := "{
+  \"id\": \"9001\", \"unread\": true, \"reason\": \"review_requested\",
+  \"updated_at\": \"2026-10-20T12:34:56Z\",
+  \"subject\": {\"title\": \"Add IMAP IDLE\", \"type\": \"PullRequest\",
+    \"url\": \"https://api.github.com/repos/chrisflav/angelia/pulls/7\",
+    \"latest_comment_url\": null},
+  \"repository\": {\"full_name\": \"chrisflav/angelia\",
+    \"html_url\": \"https://github.com/chrisflav/angelia\"}}"
+
+def githubTests (s : Suite) : IO Unit := do
+  IO.println "github"
+  let t := (Json.parse githubThread).toOption.get!
+  match Connector.GitHub.normalize t with
+  | .ok n =>
+    s.eq "title" n.title "Add IMAP IDLE"
+    s.eq "kind" n.kind "PullRequest"
+    s.eq "url" n.url (some "https://github.com/chrisflav/angelia/pull/7")
+    s.eq "thread" n.threadKey (some "9001")
+    s.eq "body without comment" n.body "PullRequest — review requested"
+    s.eq "sentAt" n.sentAt (some 1792499696)
+  | .error e => s.check "normalize" false e
+  s.eq "external id" (Connector.GitHub.externalId t) "9001@2026-10-20T12:34:56Z"
+  s.eq "next link" (Connector.GitHub.nextLink
+    "<https://api.github.com/notifications?page=2>; rel=\"next\", <https://x?page=5>; rel=\"last\"")
+    (some "https://api.github.com/notifications?page=2")
+  let (hs, body) := Http.parseHeadersAndBody
+    "HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200\r\nLast-Modified: Tue\r\nX-Poll-Interval: 60\r\n\r\n[]" 5
+  s.eq "curl headers" hs #[("last-modified", "Tue"), ("x-poll-interval", "60")]
+  s.eq "curl body" body "[]"
+
+def ruleTests (s : Suite) : IO Unit := do
+  IO.println "rules"
+  let n : NotificationData := { title := "CI failed on master", author := "github-actions" }
+  let rule (id : Int) (spec : RuleSpec) : Rule := { id, name := "", enabled := true, position := 0, spec }
+  let ci := rule 1 { conditions := #[{ field := .title, op := .contains, value := "ci failed" }],
+                     labels := #[10], markRead := true }
+  let notBot := rule 2 { conditions := #[{ field := .author, op := .startsWith, value := "github",
+                                            negate := true }], labels := #[11] }
+  let empty := rule 3 { labels := #[12] }
+  s.eq "contains, case-insensitive, with actions"
+    (evaluate #[ci, notBot, empty] "github" n) { labels := #[(1, 10)], markRead := true }
+  s.eq "any" ((rule 4 { «match» := "any", conditions := #[
+      { field := .source, op := .equals, value := "mail" },
+      { field := .source, op := .equals, value := "github" }] }).spec.matches "github" n) true
+  let j := toJson ci.spec
+  s.check "spec json roundtrip" ((fromJson? j : Except String RuleSpec).toOption.map toJson == some j)
+
+def scopeTests (s : Suite) : IO Unit := do
+  IO.println "scopes"
+  let parse (j : String) : Option Scope := (Json.parse j >>= fromJson?).toOption
+  s.eq "empty scope: everything, read-only" (parse "{}") (some {})
+  s.eq "explicit nulls are unrestricted" (parse "{\"sources\":null,\"labels\":null,\"write\":true}")
+    (some Scope.full)
+  let sc : Scope := { sources := some #["mail"], labels := some #[1, 2] }
+  s.eq "sql args" sc.sqlArgs (some "[\"mail\"]", some "[1,2]")
+  s.eq "full scope has no sql restriction" Scope.full.sqlArgs (none, none)
+  s.check "allows own label" (sc.allowsLabel 2)
+  s.check "refuses other label" (!sc.allowsLabel 3)
+  s.check "refuses other source" (!sc.allowsSource "github")
+  s.check "empty source list sees nothing" (!({ sources := some #[] } : Scope).allowsSource "mail")
+  s.eq "scope json roundtrip" (parse (toJson sc).compress) (some sc)
+
+def cryptoTests (s : Suite) : IO Unit := do
+  IO.println "crypto"
+  let bytes (l : List Nat) := ByteArray.mk (l.map Nat.toUInt8).toArray
+  -- RFC 8439, section 2.8.2.
+  let key := bytes ((List.range 32).map (0x80 + ·))
+  let nonce := bytes [7, 0, 0, 0, 0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47]
+  let aad := bytes [0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7]
+  let msg := "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the \
+    future, sunscreen would be it.".toUTF8
+  let sealed := Aead.encrypt key nonce aad msg
+  s.eq "chacha20-poly1305 ciphertext" (Crypto.toHex (sealed.extract 0 16))
+    "d31a8d34648e60db7b86afbc53ef7ec2"
+  s.eq "chacha20-poly1305 tag" (Crypto.toHex (sealed.extract msg.size sealed.size))
+    "1ae10b594f09e26a7e902ecbd0600691"
+  s.eq "decrypts" ((Aead.decrypt key nonce aad sealed).map (·.data)) (some msg.data)
+  s.eq "wrong aad is refused" ((Aead.decrypt key nonce (bytes [1]) sealed).map (·.data)) none
+  let flipped := sealed.set! 3 (sealed[3]! ^^^ 1)
+  s.eq "altered ciphertext is refused" ((Aead.decrypt key nonce aad flipped).map (·.data)) none
+  s.eq "pbkdf2" (Crypto.toHex (Crypto.pbkdf2Sha256 "password".toUTF8 "salt".toUTF8 4096))
+    "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a"
+  s.eq "pbkdf2, long key, two blocks"
+    (Crypto.toHex (Crypto.pbkdf2Sha256 (bytes (List.replicate 100 120)) "salt".toUTF8 3 40))
+    "59bfa49750dd5462ce38370a1e7abe0736ff334cf1c2f0d84f23a03435d660d1537367bcfb776a10"
+
+def vaultTests (s : Suite) : IO Unit := do
+  IO.println "vault"
+  let h ← Vault.PasswordHash.create "correct horse" 1000
+  s.check "password verifies" (h.verify "correct horse")
+  s.check "wrong password fails" (!h.verify "correct hors")
+  s.check "hash roundtrips"
+    ((Vault.PasswordHash.parse h.toString).toOption.map (·.verify "correct horse") == some true)
+  let other ← Vault.PasswordHash.create "correct horse" 1000
+  s.check "salted" (h.hash.data != other.hash.data)
+  let dataKey ← IO.getRandomBytes 32
+  let w ← Vault.WrappedKey.wrap dataKey "pw" 1000
+  s.eq "key unwraps" ((w.unwrap "pw").map (·.data)) (some dataKey.data)
+  s.eq "key needs the password" ((w.unwrap "pW").map (·.data)) none
+  let k := Vault.Keys.derive dataKey
+  let id := Vault.keyedId k
+  s.eq "keyed ids are stable" (id "mail" "mid:<a@b>") (id "mail" "mid:<a@b>")
+  s.check "keyed ids depend on the source" (id "mail" "x" != id "work" "x")
+  let c ← Vault.seal k "row 1" "Grüße"
+  s.eq "content roundtrips" (← Vault.open k "row 1" c) "Grüße"
+  s.check "content is bound to its row" ((← (Vault.open k "row 2" c).toBaseIO) matches .error _)
+
+def changeTests (s : Suite) : IO Unit := do
+  IO.println "changes"
+  let (start, _) ← changesSince 0
+  bumpChanges (some #[1, 2])
+  bumpChanges (some #[3])
+  let (now, c) ← changesSince start
+  s.eq "merged ids" (now, c) (start + 2, some #[1, 2, 3])
+  bumpChanges none
+  s.eq "unknown change" (← changesSince now).2 none
+  for _ in [0:300] do bumpChanges (some #[4])
+  s.eq "too far behind" (← changesSince now).2 none
+
+def main : IO UInt32 := do
+  let s : Suite := { failures := ← IO.mkRef #[] }
+  mimeTests s
+  imapTests s
+  githubTests s
+  ruleTests s
+  scopeTests s
+  cryptoTests s
+  vaultTests s
+  changeTests s
+  let failures ← s.failures.get
+  if failures.isEmpty then
+    IO.println "all tests passed"
+    return 0
+  else
+    IO.println s!"{failures.size} failure(s): {failures}"
+    return 1

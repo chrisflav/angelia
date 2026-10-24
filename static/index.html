@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>angelia</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <div id="login" class="login" hidden>
+    <form id="login-form">
+      <h1>angelia</h1>
+      <input id="password" type="password" placeholder="Password" autocomplete="current-password" autofocus>
+      <button type="submit">Sign in</button>
+      <p id="login-error" class="error"></p>
+    </form>
+  </div>
+  <div id="app" class="app" hidden>
+    <nav id="sidebar" class="sidebar"></nav>
+    <main class="main">
+      <header class="toolbar">
+        <input id="search" type="search" placeholder="Search  ( / )">
+        <select id="group" title="Group by">
+          <option value="">No grouping</option>
+          <option value="thread">Group by thread</option>
+          <option value="source">Group by source</option>
+          <option value="day">Group by day</option>
+        </select>
+        <button id="save-view" title="Save the current filter as a view">Save view</button>
+        <span id="live" class="live" title="Live updates">●</span>
+      </header>
+      <div class="panes">
+        <section id="list" class="list" tabindex="0"></section>
+        <section id="detail" class="detail"></section>
+      </div>
+    </main>
+  </div>
+</body>
+</html>

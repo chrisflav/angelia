@@ -1,0 +1,487 @@
+import Std.Http
+import Std.Sync.Mutex
+import Angelia.Connector.Registry
+import Angelia.Crypto
+
+/-!
+# HTTP server
+
+The read/write API for the frontend, a server-sent-events stream for live updates, the ingest
+endpoint for out-of-process sources, and the static frontend — all on `Std.Http`'s HTTP/1.1
+server. TLS is left to a reverse proxy in front.
+
+Authentication is a single password (stored as a salted PBKDF2 hash in the configuration)
+exchanged for an opaque session token in an `HttpOnly` cookie, or — for clients other than the
+browser — an API token sent as `Authorization: Bearer agl_…`. A token carries a `Scope`: the
+sources and labels it may see, and whether it may change anything. The scope is applied inside
+the database queries, so nothing outside it is ever read on a token's behalf. Labels, rules, views and tokens
+themselves are managed from a logged-in session only, so a leaked token cannot widen itself or
+mint more tokens. Only hashes of sessions and tokens are stored.
+`/api/ingest/<source>` is authenticated separately, by that source's own bearer token, since the
+programs posting to it are not clients of the inbox.
+
+Until the first sign-in after a start the server is locked (see `Angelia.Vault`): that sign-in
+unwraps the database key and starts the sources, and everything else answers 503 meanwhile.
+-/
+
+open Std.Http Std.Http.Server Std.Async Std.Net Lean
+
+namespace Angelia.Server
+
+structure AppContext where
+  config : Config
+  db : Std.Mutex Db.Conn
+  /-- Starts the sources; run once, by the sign-in that unlocks the server. -/
+  onUnlock : IO Unit
+  /-- Held while a password is checked, so attempts are made one at a time. -/
+  loginLock : Std.Mutex Unit
+
+def AppContext.withDb (ctx : AppContext) (act : Db.Conn → IO α) : IO α :=
+  ctx.db.atomically do act (← get)
+
+/-! ## Requests and responses -/
+
+structure Req where
+  method : Method
+  segments : List String
+  query : String → Option String
+  body : String
+  header : String → Option String
+
+def Req.cookie (r : Req) (name : String) : Option String := do
+  let raw ← r.header "cookie"
+  (raw.splitOn ";").findSome? fun pair =>
+    match pair.trimAscii.toString.splitOn "=" with
+    | [k, v] => if k == name then some v else none
+    | _ => none
+
+def Req.bearer (r : Req) : Option String := do
+  let h ← r.header "authorization"
+  if h.startsWith "Bearer " then some (h.drop 7).toString else none
+
+structure ApiResponse where
+  status : Status := .ok
+  body : Json := Json.mkObj []
+  headers : Array (String × String) := #[]
+
+inductive ApiError where
+  | badRequest (msg : String)
+  | unauthorized (msg : String)
+  | forbidden (msg : String)
+  | notFound (msg : String)
+  | server (msg : String)
+  | locked
+
+def ApiError.toResponse : ApiError → ApiResponse
+  | .badRequest m => { status := .badRequest, body := Json.mkObj [("error", m)] }
+  | .unauthorized m => { status := .unauthorized, body := Json.mkObj [("error", m)] }
+  | .forbidden m => { status := .forbidden, body := Json.mkObj [("error", m)] }
+  | .notFound m => { status := .notFound, body := Json.mkObj [("error", m)] }
+  | .server m => { status := .internalServerError, body := Json.mkObj [("error", m)] }
+  | .locked => { status := .serviceUnavailable
+                 body := Json.mkObj [("error", "angelia was restarted: sign in to unlock it"),
+                   ("locked", true)] }
+
+abbrev ApiM := ExceptT ApiError IO
+
+def fail (e : ApiError) : ApiM α := throwThe ApiError e
+
+def ok (j : Json) : ApiM ApiResponse := pure { body := j }
+
+def liftIO (act : IO α) : ApiM α := ExceptT.lift act
+
+def AppContext.dbM (ctx : AppContext) (act : Db.Conn → IO α) : ApiM α := liftIO (ctx.withDb act)
+
+def parseJson (body : String) : ApiM Json :=
+  match Json.parse body with
+  | .ok j => pure j
+  | .error e => fail (.badRequest s!"invalid JSON: {e}")
+
+def field? {α} [FromJson α] (j : Json) (k : String) : ApiM (Option α) :=
+  match j.getObjVal? k with
+  | .error _ => pure none
+  | .ok .null => pure none
+  | .ok v => match fromJson? v with
+    | .ok a => pure (some a)
+    | .error e => fail (.badRequest s!"'{k}': {e}")
+
+def field {α} [FromJson α] (j : Json) (k : String) : ApiM α := do
+  match ← field? j k with
+  | some a => pure a
+  | none => fail (.badRequest s!"'{k}' is required")
+
+def parseId (s : String) : ApiM Int :=
+  match s.toInt? with
+  | some n => pure n
+  | none => fail (.badRequest s!"invalid id: {s}")
+
+/-! ## Authentication -/
+
+def sessionCookie : String := "angelia_session"
+
+/-- API tokens carry a recognisable prefix, so a leaked one can be found by secret scanners. -/
+def tokenPrefix : String := "agl_"
+
+/-- Who a request is from. -/
+inductive Principal where
+  | session
+  | token (id : Int) (scope : Scope)
+
+def Principal.scope : Principal → Scope
+  | .session => Scope.full
+  | .token _ s => s
+
+def Principal.toJson : Principal → Json
+  | .session => Json.mkObj [("authenticated", true), ("via", "session"), ("scope", Lean.toJson Scope.full)]
+  | .token id s => Json.mkObj [("authenticated", true), ("via", "token"), ("tokenId", id),
+      ("scope", Lean.toJson s)]
+
+/-- Authenticate by API token if the request carries one, else by session cookie. A request with
+    a bad token is refused even if it also has a valid cookie, so a client is never silently
+    acting under a different identity than it presented. -/
+def AppContext.authenticate (ctx : AppContext) (r : Req) : IO (Option Principal) := do
+  if let some token := r.bearer then
+    if !token.startsWith tokenPrefix then return none
+    return (← ctx.withDb (Db.checkToken · (Crypto.sha256Hex token))).map fun (id, s) => .token id s
+  let some token := r.cookie sessionCookie | return none
+  if ← ctx.withDb (Db.checkSession · (Crypto.sha256Hex token) (ctx.config.sessionDays * 86400)) then
+    return some .session
+  return none
+
+def cookieAttrs (ctx : AppContext) : String :=
+  "; Path=/; HttpOnly; SameSite=Strict" ++ (if ctx.config.secureCookies then "; Secure" else "")
+
+/-- Check the password and, on the first sign-in after a start, unlock the server with it. -/
+def login (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let some stored := ctx.config.passwordHash
+    | fail (.unauthorized "no password configured (set passwordHash)")
+  let hash ← match Vault.PasswordHash.parse stored with
+    | .ok h => pure h
+    | .error e => fail (.server e)
+  let password : String ← field (← parseJson r.body) "password"
+  -- One attempt at a time, and a failed one holds the lock a second longer, so guessing runs at
+  -- about one try per second however many connections it uses.
+  let correct ← liftIO <| ctx.loginLock.atomically do
+    if !hash.verify password then
+      IO.sleep 1000
+      return false
+    if !(← Vault.unlocked) then
+      ctx.withDb (Db.unlock · password)
+      log "main" "unlocked"
+      ctx.onUnlock
+    return true
+  if !correct then fail (.unauthorized "wrong password")
+  let token ← liftIO (randomToken 32)
+  ctx.dbM fun db => Db.createSession db (Crypto.sha256Hex token)
+  pure { body := Json.mkObj [("ok", true)]
+         headers := #[("Set-Cookie", s!"{sessionCookie}={token}{cookieAttrs ctx}; Max-Age={ctx.config.sessionDays * 86400}")] }
+
+def logout (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  if let some token := r.cookie sessionCookie then
+    ctx.dbM fun db => Db.deleteSession db (Crypto.sha256Hex token)
+  pure { body := Json.mkObj [("ok", true)]
+         headers := #[("Set-Cookie", s!"{sessionCookie}={cookieAttrs ctx}; Max-Age=0")] }
+
+/-! ## Handlers -/
+
+def listNotifications (ctx : AppContext) (scope : Scope) (r : Req) : ApiM ApiResponse := do
+  let num (k : String) : ApiM (Option Int) := match r.query k with
+    | some v => if v.isEmpty then pure none else some <$> parseId v
+    | none => pure none
+  let nonEmpty (k : String) := (r.query k).filter (!·.isEmpty)
+  let f : Db.Filter := {
+    q := nonEmpty "q", source := nonEmpty "source", thread := nonEmpty "thread"
+    label := ← num "label", before := ← num "before"
+    state := (nonEmpty "state").getD "inbox"
+    limit := ((← num "limit").map Int.toNat).getD 100 }
+  let ns ← ctx.dbM (Db.listNotifications · scope f)
+  ok (Json.mkObj [("notifications", toJson ns),
+    ("next", toJson (if ns.size < f.limit then none else ns.back?.map (·.id)))])
+
+/-- A notification the scope cannot see is reported as missing, not as forbidden, so a token cannot
+    probe which ids exist outside its scope. -/
+def visible (ctx : AppContext) (scope : Scope) (id : Int) : ApiM Notification := do
+  let some n ← ctx.dbM (Db.getNotification · scope id) | fail (.notFound "no such notification")
+  pure n
+
+def getNotification (ctx : AppContext) (scope : Scope) (id : Int) (withRaw : Bool) :
+    ApiM ApiResponse := do
+  let n ← visible ctx scope id
+  let raw ← if withRaw then ctx.dbM (Db.rawPayload · id) else pure none
+  ok ((toJson n).setObjVal! "raw" (toJson raw))
+
+def patchNotifications (ctx : AppContext) (scope : Scope) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let ids : Array Int ← field j "ids"
+  let read ← field? j "read"
+  let archived ← field? j "archived"
+  let starred ← field? j "starred"
+  let changed ← ctx.dbM fun db => Db.setFlags db scope ids read archived starred
+  liftIO (bumpChanges (some changed))
+  ok (Json.mkObj [("updated", changed.size)])
+
+/-- Attach or detach a label. Under a label scope only the scope's own labels can be touched;
+    detaching one may take the notification out of the token's sight, which is allowed. -/
+def setLabel (ctx : AppContext) (scope : Scope) (id label : Int) (on : Bool) : ApiM ApiResponse := do
+  discard <| visible ctx scope id
+  if !scope.allowsLabel label then fail (.forbidden "label outside this token's scope")
+  ctx.dbM (Db.setLabel · id label on)
+  liftIO (bumpChanges (some #[id]))
+  ok (Json.mkObj [("ok", true)])
+
+def createLabel (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let name : String ← field j "name"
+  let color := ((← field? j "color") : Option String).getD "#6b7280"
+  ok (toJson (← ctx.dbM fun db => Db.createLabel db name color))
+
+def createRule (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let id ← ctx.dbM fun db => do
+    Db.createRule db (← IO.ofExcept (j.getObjValAs? String "name"))
+      ((j.getObjValAs? Bool "enabled").toOption.getD true)
+      ((j.getObjValAs? Int "position").toOption.getD 0)
+      (← IO.ofExcept (j.getObjValAs? RuleSpec "spec"))
+  ok (Json.mkObj [("id", id)])
+
+def updateRule (ctx : AppContext) (id : Int) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let name ← field? j "name"
+  let enabled ← field? j "enabled"
+  let position ← field? j "position"
+  let spec ← field? j "spec"
+  ctx.dbM fun db => Db.updateRule db id name enabled position spec
+  ok (Json.mkObj [("ok", true)])
+
+def sources (ctx : AppContext) (scope : Scope) : ApiM ApiResponse := do
+  let health ← match ← ctx.dbM Db.listHealth with
+    | .arr hs => pure (hs.filter fun h =>
+        scope.allowsSource ((h.getObjValAs? String "source").toOption.getD ""))
+    | _ => pure #[]
+  ok (Json.mkObj [
+    ("configured", toJson ((ctx.config.sources.filter (scope.allowsSource ·.name)).map fun s =>
+      Json.mkObj [("name", s.name), ("kind", s.kind), ("enabled", s.enabled)])),
+    ("health", toJson health)])
+
+/-- `POST /api/tokens` body: `{"name": ..., "scope": {"sources": [...]|null,
+    "labels": [...]|null, "write": bool}}`. Unknown sources and labels are refused rather than
+    stored, since a typo would otherwise silently produce a token that sees nothing. -/
+def createToken (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let name : String ← field j "name"
+  if name.trimAscii.isEmpty then fail (.badRequest "a token needs a name")
+  let scope : Scope := (← field? j "scope").getD {}
+  for src in scope.sources.getD #[] do
+    if !ctx.config.sources.any (·.name == src) then fail (.badRequest s!"no source named '{src}'")
+  let labels ← ctx.dbM Db.listLabels
+  for l in scope.labels.getD #[] do
+    if !labels.any (·.id == l) then fail (.badRequest s!"no label with id {l}")
+  let token := tokenPrefix ++ (← liftIO (randomToken 32))
+  let id ← ctx.dbM (Db.createToken · name (Crypto.sha256Hex token) scope)
+  -- The only time the token itself is ever seen.
+  ok (Json.mkObj [("id", id), ("name", name), ("token", token), ("scope", toJson scope)])
+
+/-- `POST /api/ingest/<source>` — the extension point for sources implemented outside angelia.
+    Body: `{"externalId": "...", "notification": {"title": ..., ...}, ...anything else}`; the
+    whole body is stored as the raw event. A batch is a JSON array of such objects. -/
+def ingest (ctx : AppContext) (sourceName : String) (r : Req) : ApiM ApiResponse := do
+  let some source := ctx.config.sources.find? (·.name == sourceName)
+    | fail (.notFound s!"no source named '{sourceName}'")
+  let some kind := Connector.kind? source.kind | fail (.server s!"unknown kind '{source.kind}'")
+  let some expected ← liftIO (secret source.settings "token")
+    | fail (.unauthorized s!"source '{sourceName}' has no ingest token configured")
+  -- Compared as digests, so the time taken says nothing about how much of the token matched.
+  let digest (t : String) := Crypto.sha256 t.toUTF8
+  if (r.bearer.map digest) != some (digest expected) then fail (.unauthorized "invalid ingest token")
+  let j ← parseJson r.body
+  let items := match j with
+    | .arr xs => xs
+    | x => #[x]
+  let events ← items.mapM fun item => do
+    let externalId : String ← field item "externalId"
+    -- Reject what would not normalise, rather than storing an event that never shows up.
+    match kind.normalize item with
+    | .error e => fail (.badRequest s!"{externalId}: {e}")
+    | .ok _ => pure ({ externalId, payload := item } : RawEvent)
+  let n ← ctx.dbM fun db => do
+    let cctx : ConnectorCtx := { source, dbPath := ctx.config.dbPath, db
+                                 normalize := kind.normalize, stop := ← IO.mkRef false }
+    cctx.health "ok" (some "last push accepted")
+    cctx.ingest events
+  ok (Json.mkObj [("received", events.size), ("new", n)])
+
+def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
+  match r.method, r.segments with
+  | .post, ["login"] => login ctx r
+  | .post, ["logout"] => logout ctx r
+  | _, _ =>
+  if !(← liftIO Vault.unlocked) then fail .locked
+  match r.method, r.segments with
+  | .post, ["ingest", source] => ingest ctx source r
+  | _, _ =>
+  let some principal ← liftIO (ctx.authenticate r) | fail (.unauthorized "not logged in")
+  let scope := principal.scope
+  -- Everything that shapes the whole inbox (labels, rules, views, tokens) is the owner's, i.e. a
+  -- logged-in session's. Tokens read and triage notifications within their scope, nothing else.
+  let requireSession : ApiM Unit := match principal with
+    | .session => pure ()
+    | .token .. => fail (.forbidden "only a logged-in session may do this")
+  let requireWrite : ApiM Unit :=
+    if scope.write then pure () else fail (.forbidden "this token is read-only")
+  match r.method, r.segments with
+  | .get, ["me"] => ok principal.toJson
+  | .get, ["notifications"] => listNotifications ctx scope r
+  | .patch, ["notifications"] => requireWrite; patchNotifications ctx scope r
+  | .get, ["notifications", id] =>
+    getNotification ctx scope (← parseId id) (r.query "raw" == some "1")
+  | .put, ["notifications", id, "labels", label] =>
+    requireWrite; setLabel ctx scope (← parseId id) (← parseId label) true
+  | .delete, ["notifications", id, "labels", label] =>
+    requireWrite; setLabel ctx scope (← parseId id) (← parseId label) false
+  | .get, ["counts"] => ok (← ctx.dbM (Db.counts · scope))
+  | .get, ["labels"] =>
+    ok (toJson ((← ctx.dbM Db.listLabels).filter (scope.allowsLabel ·.id)))
+  | .get, ["sources"] => sources ctx scope
+  | _, _ =>
+  requireSession
+  match r.method, r.segments with
+  | .get, ["tokens"] => ok (← ctx.dbM Db.listTokens)
+  | .post, ["tokens"] => createToken ctx r
+  | .delete, ["tokens", id] =>
+    if ← ctx.dbM (Db.deleteToken · (← parseId id)) then ok (Json.mkObj [("ok", true)])
+    else fail (.notFound "no such token")
+  | .post, ["labels"] => createLabel ctx r
+  | .patch, ["labels", id] =>
+    let j ← parseJson r.body
+    ctx.dbM (Db.updateLabel · (← parseId id) (← field? j "name") (← field? j "color"))
+    ok (Json.mkObj [("ok", true)])
+  | .delete, ["labels", id] =>
+    ctx.dbM (Db.deleteLabel · (← parseId id))
+    ok (Json.mkObj [("ok", true)])
+  | .get, ["rules"] => ok (toJson (← ctx.dbM Db.listRules))
+  | .post, ["rules"] => createRule ctx r
+  | .post, ["rules", "rerun"] =>
+    let n ← ctx.dbM Db.rerunRules
+    liftIO (bumpChanges none)
+    ok (Json.mkObj [("matched", n)])
+  | .patch, ["rules", id] => updateRule ctx (← parseId id) r
+  | .delete, ["rules", id] =>
+    ctx.dbM (Db.deleteRule · (← parseId id))
+    ok (Json.mkObj [("ok", true)])
+  | .get, ["views"] => ok (toJson (← ctx.dbM Db.listViews))
+  | .post, ["views"] =>
+    let j ← parseJson r.body
+    let name : String ← field j "name"
+    let query : Json ← field j "query"
+    ok (Json.mkObj [("id", ← ctx.dbM (Db.createView · name query))])
+  | .delete, ["views", id] =>
+    ctx.dbM (Db.deleteView · (← parseId id))
+    ok (Json.mkObj [("ok", true)])
+  | _, _ => fail (.notFound "no such endpoint")
+
+def runApi (ctx : AppContext) (r : Req) : IO ApiResponse := do
+  try
+    match ← (dispatch ctx r).run with
+    | .ok resp => pure resp
+    | .error e => pure e.toResponse
+  catch e =>
+    log "http" s!"{r.method} /{"/".intercalate r.segments}: {e}"
+    pure (ApiError.server (toString e)).toResponse
+
+/-! ## Wire -/
+
+def headerValue (r : Request Body.Stream) (name : String) : Option String :=
+  (Header.Name.ofString? name).bind (r.line.headers.get? ·) |>.map toString
+
+def buildResponse (r : ApiResponse) : Async (Response Body.Full) :=
+  let base := Response.withStatus r.status |>.header! "Cache-Control" "no-store"
+  (r.headers.foldl (fun b (k, v) => b.header! k v) base).json r.body.compress
+
+def contentTypeOf (name : String) : String :=
+  if name.endsWith ".html" then "text/html; charset=utf-8"
+  else if name.endsWith ".js" then "text/javascript; charset=utf-8"
+  else if name.endsWith ".css" then "text/css; charset=utf-8"
+  else if name.endsWith ".svg" then "image/svg+xml"
+  else "application/octet-stream"
+
+/-- Security headers for the frontend: the app loads nothing from anywhere else. -/
+def withPageHeaders (b : Response.Builder) : Response.Builder :=
+  b |>.header! "Content-Security-Policy"
+      "default-src 'self'; img-src 'self' data:; style-src 'self'; frame-ancestors 'none'"
+    |>.header! "X-Content-Type-Options" "nosniff"
+    |>.header! "Referrer-Policy" "no-referrer"
+
+def serveStatic (ctx : AppContext) (segs : List String) : Async (Response Body.Full) := do
+  if segs.any (fun s => s == ".." || s.startsWith ".") then
+    return ← Response.notFound.text "not found"
+  let rel := if segs.isEmpty then "index.html" else "/".intercalate segs
+  let path := ctx.config.staticDir / rel
+  let file := if (← (path.pathExists : IO Bool)) && !(← (path.isDir : IO Bool)) then path
+    else ctx.config.staticDir / "index.html"
+  if !(← (file.pathExists : IO Bool)) then
+    return ← Response.notFound.text s!"no frontend at {ctx.config.staticDir}"
+  let bytes ← (IO.FS.readBinFile file : IO ByteArray)
+  (withPageHeaders Response.ok
+    |>.header! "Content-Type" (contentTypeOf file.toString)
+    |>.header! "Cache-Control" "no-cache").fromBytes bytes
+
+/-- `GET /api/events`: a server-sent-events stream that says `change` whenever notifications the
+    principal may see change, and pings every 20 s so proxies keep the connection open. The event
+    carries nothing else, so a scoped token learns nothing about activity outside its scope. -/
+def eventStream (ctx : AppContext) (principal : Principal) : Async (Response Body.Stream) :=
+  let relevant : Change → IO Bool := fun c => match principal, c with
+    | .session, _ | _, none => pure true
+    | .token _ scope, some ids => ctx.withDb (Db.anyVisible · scope ids)
+  (Response.ok
+    |>.header! "Content-Type" "text/event-stream"
+    |>.header! "Cache-Control" "no-store"
+    |>.header! "X-Accel-Buffering" "no").stream fun s => do
+    let send (text : String) : Async Unit := s.send (Chunk.ofByteArray text.toUTF8)
+    send "retry: 3000\n\n"
+    let mut seen := (← (changeLog.get : IO _)).1
+    let mut ticks := 0
+    while !(← s.isClosed) do
+      Std.Async.sleep ⟨500⟩
+      let (now, change) ← (changesSince seen : IO _)
+      if now != seen then
+        seen := now
+        if ← (relevant change : IO Bool) then send "event: change\ndata: 1\n\n"
+      ticks := ticks + 1
+      if ticks % 40 == 0 then send ": ping\n\n"
+
+structure AppHandler where
+  ctx : AppContext
+
+instance : Handler AppHandler where
+  ResponseBody := Body.Any
+  onRequest h req := do
+    let segs := (req.line.uri.path.toDecodedSegments.filter (· ≠ "")).toList
+    match segs with
+    | ["api", "events"] =>
+      let r : Req := { method := req.line.method, segments := [], query := fun _ => none
+                       body := "", header := headerValue req }
+      if !(← (Vault.unlocked : IO Bool)) then
+        return ((← (Response.withStatus .serviceUnavailable).text "locked" : Response Body.Full) :
+          Response Body.Any)
+      if let some p ← (h.ctx.authenticate r : IO (Option Principal)) then
+        return ((← eventStream h.ctx p : Response Body.Stream) : Response Body.Any)
+      else
+        return ((← (Response.withStatus .unauthorized).text "not logged in" : Response Body.Full) :
+          Response Body.Any)
+    | "api" :: rest =>
+      let body ← req.body.readAll (maximumSize := some (16 * 1024 * 1024 : UInt64))
+      let r : Req := { method := req.line.method, segments := rest
+                       query := fun k => req.line.uri.query.get k, body
+                       header := headerValue req }
+      return ((← buildResponse (← (runApi h.ctx r : IO ApiResponse)) : Response Body.Full) :
+        Response Body.Any)
+    | _ => return ((← serveStatic h.ctx segs : Response Body.Full) : Response Body.Any)
+  onFailure _ err := do
+    log "http" s!"connection error: {err}"
+
+def serve (ctx : AppContext) : Async Server := do
+  let ip := IPv4Addr.ofString ctx.config.host |>.getD (IPv4Addr.ofParts 127 0 0 1)
+  let addr : SocketAddress := .v4 { addr := ip, port := ctx.config.port }
+  Std.Http.Server.serve addr (AppHandler.mk ctx) { maxHeaders := 256 }
+
+end Angelia.Server

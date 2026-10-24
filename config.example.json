@@ -1,0 +1,38 @@
+{
+  "host": "127.0.0.1",
+  "port": 8090,
+  "dbPath": "angelia.sqlite",
+  "staticDir": "static",
+  "passwordHash": "output of: angelia hash-password",
+  "secureCookies": true,
+  "sources": [
+    {
+      "name": "mail",
+      "kind": "imap",
+      "host": "imap.example.org",
+      "port": 993,
+      "tls": "implicit",
+      "username": "me@example.org",
+      "passwordCommand": ["pass", "show", "mail/imap"],
+      "folders": ["INBOX"],
+      "initialSync": 50
+    },
+    {
+      "name": "work-mail",
+      "kind": "imap",
+      "host": "outlook.office365.com",
+      "username": "me@company.example",
+      "accessTokenCommand": ["oama", "access", "me@company.example"]
+    },
+    {
+      "name": "github",
+      "kind": "github",
+      "tokenCommand": ["pass", "show", "github/notifications-token"]
+    },
+    {
+      "name": "sms",
+      "kind": "ingest",
+      "tokenCommand": ["pass", "show", "angelia/sms-ingest"]
+    }
+  ]
+}
