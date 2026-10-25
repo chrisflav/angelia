@@ -82,6 +82,8 @@ structure ApiResponse where
   status : Status := .ok
   body : Json := Json.mkObj []
   headers : Array (String × String) := #[]
+  /-- Sent instead of `body`, for the one endpoint that answers with a file. -/
+  bytes : Option ByteArray := none
 
 inductive ApiError where
   | badRequest (msg : String)
@@ -390,6 +392,38 @@ def getNotification (ctx : AppContext) (scope : Scope) (id : Int) (withRaw : Boo
   let raw ← if withRaw then ctx.dbM (Db.rawPayload · id) else pure none
   ok ((toJson n).setObjVal! "raw" (toJson raw))
 
+/-- A `Content-Disposition` that makes the browser save the file, under its name: an ASCII
+    fallback, and the name itself in RFC 5987 form. -/
+def downloadDisposition (name : String) : String :=
+  let fallback := String.ofList (name.toList.map fun c =>
+    if c.toNat ≥ 0x20 && c.toNat < 0x7F && c != '"' && c != '\\' then c else '_')
+  let unreserved (b : UInt8) : Bool :=
+    let c := Char.ofNat b.toNat
+    c.isAlphanum || c == '-' || c == '.' || c == '_' || c == '~'
+  let hex := "0123456789ABCDEF".toList.toArray
+  let encoded := name.toUTF8.foldl (fun s b =>
+    if unreserved b then s.push (Char.ofNat b.toNat)
+    else s.push '%' |>.push hex[b.toNat / 16]! |>.push hex[b.toNat % 16]!) ""
+  s!"attachment; filename=\"{fallback}\"; filename*=UTF-8''{encoded}"
+
+/-- `GET /api/notifications/<id>/attachments/<n>`: attachment `n` of a mail, extracted from the
+    stored message. What a sender put in a mail must never run as this site, so it is always a
+    download -- never shown inline -- and its type is passed on only if it is a plain media type,
+    with sniffing off and a sandboxing CSP should a browser render it anyway. -/
+def getAttachment (ctx : AppContext) (scope : Scope) (id index : Int) : ApiM ApiResponse := do
+  discard <| visible ctx scope id
+  if index < 0 then fail (.notFound "no such attachment")
+  let raw := (← ctx.dbM (Db.rawPayload · id)).bind (·.getObjValAs? String "raw" |>.toOption)
+  let some (a, bytes) := raw.bind (Mail.attachmentAt · index.toNat)
+    | fail (.notFound "no such attachment")
+  let plain := a.mime.toList.all (fun c => c.isAlphanum || "/.+-_".toList.contains c)
+    && (a.mime.splitOn "/").length == 2
+  pure { bytes := some bytes, headers := #[
+    ("Content-Type", if plain then a.mime else "application/octet-stream"),
+    ("Content-Disposition", downloadDisposition a.name),
+    ("X-Content-Type-Options", "nosniff"),
+    ("Content-Security-Policy", "sandbox; default-src 'none'")] }
+
 def patchNotifications (ctx : AppContext) (scope : Scope) (r : Req) : ApiM ApiResponse := do
   let j ← parseJson r.body
   let ids : Array Int ← field j "ids"
@@ -515,6 +549,8 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   | .patch, ["notifications"] => requireWrite; patchNotifications ctx scope r
   | .get, ["notifications", id] =>
     getNotification ctx scope (← parseId id) (r.query "raw" == some "1")
+  | .get, ["notifications", id, "attachments", n] =>
+    getAttachment ctx scope (← parseId id) (← parseId n)
   | .put, ["notifications", id, "labels", label] =>
     requireWrite; setLabel ctx scope (← parseId id) (← parseId label) true
   | .delete, ["notifications", id, "labels", label] =>
@@ -582,7 +618,10 @@ def headerValue (r : Request Body.Stream) (name : String) : Option String :=
 
 def buildResponse (r : ApiResponse) : Async (Response Body.Full) :=
   let base := Response.withStatus r.status |>.header! "Cache-Control" "no-store"
-  (r.headers.foldl (fun b (k, v) => b.header! k v) base).json r.body.compress
+  let b := r.headers.foldl (fun b (k, v) => b.header! k v) base
+  match r.bytes with
+  | some bytes => b.fromBytes bytes
+  | none => b.json r.body.compress
 
 def contentTypeOf (name : String) : String :=
   if name.endsWith ".html" then "text/html; charset=utf-8"

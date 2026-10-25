@@ -398,8 +398,28 @@ function renderDetail() {
         state.labels.map((l) => h("label", { class: "label-toggle" },
           h("input", { type: "checkbox", checked: n.labels.includes(l.id),
             onchange: (e) => toggleLabel(l, e.target.checked) }),
-          h("span", { class: "dot", style: { background: l.color } }), l.name)))),
+          h("span", { class: "dot", style: { background: l.color } }), l.name))),
+      attachmentList(n)),
     h("div", { class: "body" }, n.body.trim() ? renderMessage(n.body) : h("p", { class: "hint" }, "No text.")));
+}
+
+/** A byte count as people read it: 812 B, 4.2 KB, 31 MB. */
+function byteSize(n) {
+  if (n < 1024) return `${n} B`;
+  const units = ["KB", "MB", "GB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)} ${units[i]}`;
+}
+
+/** The message's attachments, each a download; the server sends them only as downloads. */
+function attachmentList(n) {
+  if (!n.attachments?.length) return null;
+  return h("ul", { class: "attachments", "aria-label": "Attachments" },
+    n.attachments.map((a, i) => h("li", {},
+      h("a", { href: `/api/notifications/${n.id}/attachments/${i}`, download: a.name, title: a.mime }, a.name),
+      h("span", { class: "size", title: a.partial ? "The message was larger than what is fetched of it" : null },
+        byteSize(a.size) + (a.partial ? ", incomplete" : "")))));
 }
 
 /* ---------- message bodies ---------- */

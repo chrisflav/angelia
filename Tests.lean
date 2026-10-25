@@ -57,6 +57,98 @@ def htmlMail : String := crlf [
   "PGh0bWw+PHN0eWxlPnB7Y29sb3I6cmVkfTwvc3R5bGU+PHA+T3JkZXIgJmFtcDsgc2hpcHBpbmc8",
   "L3A+PHA+NSAmZXVybzsgY2hhcmdlZCCAPC9wPjwvaHRtbD4="]
 
+/-- A report with a PDF (RFC 2231 name), a text file (encoded-word name), an inline image in a
+    nested `multipart/related`, a forwarded message without a name, and a binary part. -/
+def attachmentMail : String := crlf [
+  "From: a@example.org",
+  "Subject: report",
+  "Message-ID: <att@example.org>",
+  "Content-Type: multipart/mixed; boundary=\"OUT\"",
+  "",
+  "--OUT",
+  "Content-Type: multipart/related; boundary=\"REL\"",
+  "",
+  "--REL",
+  "Content-Type: text/html; charset=utf-8",
+  "",
+  "<p>See <img src=\"cid:logo\"></p>",
+  "--REL",
+  "Content-Type: image/png; name=\"logo.png\"",
+  "Content-Transfer-Encoding: base64",
+  "Content-ID: <logo>",
+  "",
+  "iVBORw0K",
+  "--REL--",
+  "--OUT",
+  "Content-Type: application/pdf",
+  "Content-Disposition: attachment; filename*=UTF-8''Pr%C3%BCfung%202026.pdf",
+  "Content-Transfer-Encoding: base64",
+  "",
+  "aGVsbG8g",
+  "d29ybGQ=",
+  "--OUT",
+  "Content-Type: text/plain; name=\"=?UTF-8?B?w5xiZXJzaWNodC50eHQ=?=\"",
+  "Content-Disposition: attachment",
+  "Content-Transfer-Encoding: quoted-printable",
+  "",
+  "Gr=C3=BC=C3=9Fe",
+  "--OUT",
+  "Content-Type: message/rfc822",
+  "",
+  "Subject: inner",
+  "",
+  "inner body",
+  "--OUT",
+  "Content-Type: application/octet-stream; name=\"../../bin.dat\"",
+  "Content-Transfer-Encoding: binary",
+  "",
+  "\x00\xff\r",
+  "--OUT--",
+  ""]
+
+def attachmentTests (s : Suite) : IO Unit := do
+  IO.println "attachments"
+  let m := parseMessage attachmentMail
+  s.eq "the html is the text, not an attachment" m.text "See"
+  s.eq "attachment names" (m.attachments.map (·.name))
+    #["logo.png", "Prüfung 2026.pdf", "Übersicht.txt", "attachment-4.eml", "bin.dat"]
+  s.eq "attachment types" (m.attachments.map (·.mime))
+    #["image/png", "application/pdf", "text/plain", "message/rfc822", "application/octet-stream"]
+  s.eq "sizes: base64 exact, qp decoded" ((m.attachments.map (·.size)).extract 0 3) #[6, 11, 7]
+  s.eq "none partial in a closed message" (m.attachments.map (·.partial)) #[false, false, false, false, false]
+  s.eq "pdf content" ((attachmentAt attachmentMail 1).map (·.2.toList)) (some "hello world".toUTF8.toList)
+  s.eq "qp content" ((attachmentAt attachmentMail 2).map (fun (_, b) => String.fromUTF8? b))
+    (some (some "Grüße"))
+  -- The CRLF before a delimiter is the delimiter's; the part's own trailing CR stays.
+  s.eq "binary content is exact" ((attachmentAt attachmentMail 4).map (·.2.toList))
+    (some [0x00, 0xff, 0x0d])
+  s.eq "forwarded message content" ((attachmentAt attachmentMail 3).map (fun (_, b) => latin1 b))
+    (some "Subject: inner\r\n\r\ninner body")
+  s.eq "no attachment past the last" ((attachmentAt attachmentMail 5).map (·.1.name)) none
+  s.eq "rfc 2231 continuations" (paramValue (parseContentType
+      "attachment; filename*0*=UTF-8''%C3%A4; filename*1=\"bc.txt\"") "filename") (some "äbc.txt")
+  s.eq "plain mail has none" (parseMessage multipartMail).attachments #[]
+  s.eq "no directories in a file name" (cleanFileName "C:\\Users\\x\\..\\a.doc") (some "a.doc")
+  s.eq "a name of dots is none" (cleanFileName "..") none
+  -- Cut off in the middle of the PDF: the PDF is the part that never closed.
+  let cut := (attachmentMail.splitOn "d29ybGQ=").headD ""
+  let c := parseMessage cut
+  s.eq "cut: parts up to the cut" (c.attachments.map (·.name)) #["logo.png", "Prüfung 2026.pdf"]
+  s.eq "cut: the last one is marked" (c.attachments.map (·.partial)) #[false, true]
+  let normalizeCut (truncated : Bool) :=
+    (Connector.ImapSource.normalize (Json.mkObj [("raw", cut), ("truncated", truncated)])).toOption
+      |>.map (·.attachments.map (·.partial))
+  s.eq "cut and truncated: partial" (normalizeCut true) (some #[false, true])
+  s.eq "unclosed but whole (a sloppy sender): not partial" (normalizeCut false) (some #[false, false])
+  s.eq "download disposition"
+    (Server.downloadDisposition "Prüfung \"1\".pdf")
+    "attachment; filename=\"Pr_fung _1_.pdf\"; filename*=UTF-8''Pr%C3%BCfung%20%221%22.pdf"
+  IO.println "encodings"
+  s.eq "base64 with line breaks" (String.fromUTF8? (base64Decode "aGVs\r\nbG8gd29y\r\nbGQ=")) (some "hello world")
+  s.eq "base64, no padding" (base64Decode "aGk").toList "hi".toUTF8.toList
+  let bytes := ByteArray.mk #[0, 0x41, 0x80, 0xff, 0x0d, 0x0a]
+  s.eq "latin1 round trip" (toBytes (latin1 bytes)).toList bytes.toList
+
 def mimeTests (s : Suite) : IO Unit := do
   s.eq "html: links keep their target"
     (htmlToText "see <a href=\"https://x.org/a?b=1&amp;c=2\" target=_blank>the slides</a>, <a href='https://y.org'>https://y.org</a>")
@@ -101,6 +193,16 @@ def imapTests (s : Suite) : IO Unit := do
     s.eq "fetch flags" f.flags #["\\Seen", "\\Answered"]
     s.eq "fetch body literal" f.body (some body)
     s.eq "fetch internaldate" f.internalDate (some "17-Jul-2026 02:44:25 -0700")
+  s.eq "fetch rfc822.size" ((Response.fetch? #[.text "* 3 FETCH (UID 17 RFC822.SIZE 52011)"]).map
+    fun f => (f.uid, f.size)) (some (some 17, some 52011))
+  s.eq "batches by count" (Connector.ImapSource.planBatches #[(1, 10), (2, 10), (3, 10)] 2 100 100)
+    #[#[1, 2], #[3]]
+  s.eq "batches by bytes, a big one alone"
+    (Connector.ImapSource.planBatches #[(1, 40), (2, 70), (3, 10), (4, 10)] 10 100 1000)
+    #[#[1], #[2, 3, 4]]
+  s.eq "batches count a message at most maxBytes"
+    (Connector.ImapSource.planBatches #[(1, 500), (2, 500)] 10 100 50) #[#[1, 2]]
+  s.eq "uid set ranges" (Connector.ImapSource.uidSet #[3, 4, 5, 9, 11, 12]) "3:5,9,11:12"
   s.eq "literal size" (literalSize? "* 1 FETCH (BODY[] {123}") (some 123)
   s.eq "literal+ size" (literalSize? "a LOGIN {5+}") (some 5)
   s.eq "no literal" (literalSize? "* OK done") none
@@ -338,6 +440,7 @@ def secondFactorCryptoTests (s : Suite) : IO Unit := do
 def main : IO UInt32 := do
   let s : Suite := { failures := ← IO.mkRef #[] }
   mimeTests s
+  attachmentTests s
   imapTests s
   githubTests s
   ruleTests s

@@ -107,10 +107,14 @@ class Handler(socketserver.StreamRequestHandler):
                 for k in parse_set(spec, keys):
                     seq = keys.index(k) + 1 if by_uid else k
                     uid, data = snapshot[seq - 1]
+                    if "BODY" not in items.upper():
+                        self.send(f"* {seq} FETCH (UID {uid} RFC822.SIZE {len(data)})\r\n".encode())
+                        continue
                     body = data[:limit] if limit else data
                     self.send(f"* {seq} FETCH (UID {uid} FLAGS () INTERNALDATE "
                               f"\"20-Oct-2026 10:00:00 +0000\" BODY[]<0> {{{len(body)}}}\r\n"
                               .encode() + body + b")\r\n")
+                print(cmd, spec, items, file=sys.stderr, flush=True)
             elif cmd == "IDLE":
                 self.send(b"+ idling\r\n")
                 idlers.add(self)
