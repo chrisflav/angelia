@@ -268,6 +268,13 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--line); borde
 .label-toggle input { position: absolute; opacity: 0; pointer-events: none; }
 .label-toggle:has(input:checked) { color: var(--ink); border-color: var(--ink); background: var(--pane); }
 .label-toggle:has(input:focus-visible) { outline: 2px solid var(--accent); }
+.msg-header .attachments { list-style: none; padding: 0; margin: 10px 0 0; display: flex; gap: 6px; flex-wrap: wrap; }
+.msg-header .attachments li {
+  display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%; padding: 2px 8px;
+  background: var(--pane); border: 1px solid var(--line); border-radius: 4px;
+}
+.msg-header .attachments a { overflow-wrap: anywhere; }
+.msg-header .attachments .size { color: var(--muted); font-size: 12px; white-space: nowrap; }
 
 .body { padding: 16px 20px 32px; max-width: 80ch; line-height: 1.5; overflow-wrap: anywhere; }
 .body p, .body ul, .body ol, .body pre, .body table { margin: 0 0 0.75em; }

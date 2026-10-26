@@ -181,6 +181,13 @@ def fetch (c : Conn) (set : String) (byUid : Bool) (maxBytes : Nat) : IO (Array 
   let rs ← c.command s!"{pre}FETCH {set} (UID FLAGS INTERNALDATE BODY.PEEK[]<0.{maxBytes}>)"
   return rs.filterMap Response.fetch?
 
+/-- The UIDs and sizes of the messages in `set` (see `fetch`), without their contents: what it
+    takes to plan fetching them in batches. -/
+def fetchSizes (c : Conn) (set : String) (byUid : Bool) : IO (Array Fetched) := do
+  let pre := if byUid then "UID " else ""
+  let rs ← c.command s!"{pre}FETCH {set} (UID RFC822.SIZE)"
+  return rs.filterMap Response.fetch?
+
 /-- End the current `IDLE`. Only the first call per `IDLE` writes anything. -/
 def sendDone (c : Conn) : IO Unit := do
   let already ← c.doneSent.modifyGet fun d => (d, true)

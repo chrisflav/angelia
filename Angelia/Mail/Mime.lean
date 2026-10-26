@@ -1,4 +1,5 @@
 import Angelia.Util
+import Angelia.Model
 
 /-!
 # Internet message parsing
@@ -27,21 +28,23 @@ private def b64Value (c : Char) : Option Nat :=
 
 /-- Decode base64, skipping whitespace and anything else outside the alphabet (as RFC 2045
     requires of a decoder). Accepts the URL-safe alphabet too, which GitHub uses. -/
-def base64Decode (s : String) : ByteArray := Id.run do
-  let mut out := ByteArray.empty
-  let mut acc : Nat := 0
-  let mut bits : Nat := 0
-  for c in s.toList do
-    if c == '=' then break
-    match b64Value c with
-    | none => pure ()
-    | some v =>
-      acc := (acc <<< 6 ||| v) &&& 0xFFFFFF
-      bits := bits + 6
-      if bits ≥ 8 then
-        bits := bits - 8
-        out := out.push (UInt8.ofNat ((acc >>> bits) &&& 0xFF))
-  return out
+def base64Decode (s : String) : ByteArray :=
+  -- A fold rather than a loop over `s.toList`, which would hold a list cell per character, and
+  -- an attachment can be tens of megabytes. The state: output, bit buffer, bits in it, done.
+  let start :=
+    (ByteArray.emptyWithCapacity (s.utf8ByteSize * 3 / 4), (0 : UInt32), (0 : UInt32), false)
+  let (out, _, _, _) := s.foldl (fun (st : ByteArray × UInt32 × UInt32 × Bool) c =>
+    let (out, acc, bits, done) := st
+    if done then st
+    else if c == '=' then (out, acc, bits, true)
+    else match b64Value c with
+      | none => st
+      | some v =>
+        let acc := ((acc <<< 6) ||| v.toUInt32) &&& 0xFFFFFF
+        if bits + 6 ≥ 8 then
+          (out.push ((acc >>> (bits - 2)) &&& 0xFF).toUInt8, acc, bits - 2, false)
+        else (out, acc, bits + 6, false)) start
+  out
 
 private def hexValue (c : Char) : Option Nat :=
   if '0' ≤ c && c ≤ '9' then some (c.toNat - '0'.toNat)
@@ -320,6 +323,39 @@ where
       if blank l && (acc.head?.map blank |>.getD true) then acc else l :: acc) []
     "\n".intercalate kept.reverse |>.trimAscii.toString
 
+/-- The parts between `--boundary` delimiter lines, excluding preamble and epilogue, and whether
+    the closing `--boundary--` was there: a message cut off in the middle has its last part
+    without one. The line break before a delimiter belongs to the delimiter (RFC 2046 §5.1.1),
+    so a part keeps no trailing CR -- which matters for a binary part. -/
+def splitMultipart (body boundary : String) : List String × Bool :=
+  let delim := "--" ++ boundary
+  let lines := body.splitOn "\n"
+  let join (cur : List String) : String :=
+    let s := "\n".intercalate cur.reverse
+    if s.endsWith "\r" then (s.dropEnd 1).toString else s
+  let step (st : Bool × List String × List String × Bool) (line : String) :=
+    let (inPart, parts, cur, done) := st
+    if done then st else
+    let l := if line.endsWith "\r" then (line.dropEnd 1).toString else line
+    if l == delim ++ "--" then
+      (false, (if inPart then join cur :: parts else parts), [], true)
+    else if l == delim then
+      (true, (if inPart then join cur :: parts else parts), [], false)
+    else if inPart then (inPart, parts, line :: cur, false)
+    else st
+  let (_, parts, cur, done) := lines.foldl step (false, [], [], false)
+  let parts := if !cur.isEmpty then join cur :: parts else parts
+  (parts.reverse, done)
+
+/-- A body part's header fields and body. -/
+def splitPart (p : String) : Headers × String :=
+  -- A part with no header fields starts directly with the blank line.
+  if p.startsWith "\r\n" || p.startsWith "\n" then
+    (#[], (p.dropWhile (· == '\r')).drop 1 |>.toString)
+  else
+    let (h, b) := splitHeaderBody p
+    (parseHeaders h, b)
+
 /-- The readable text of a MIME entity, given its headers and (byte-string) body: the first
     `text/plain` leaf, else the first `text/html` leaf converted to text. Returns `none` if the
     entity has neither. Nested multiparts are searched depth-first, at most `depth` levels. -/
@@ -333,11 +369,7 @@ partial def extractText (hs : Headers) (body : String) (depth : Nat := 8) : Opti
     match ct.param? "boundary" with
     | none => none
     | some boundary =>
-      let parts := splitMultipart body boundary |>.map fun p =>
-        let (h, b) := splitHeaderBody p
-        -- A part with no header fields starts directly with the blank line.
-        let (h, b) := if p.startsWith "\r\n" || p.startsWith "\n" then ("", (p.dropWhile (· == '\r')).drop 1 |>.toString) else (h, b)
-        (parseHeaders h, b)
+      let parts := (splitMultipart body boundary).1.map splitPart
       let plain := parts.findSome? fun (h, b) =>
         let pct := parseContentType ((h.get? "content-type").getD "text/plain")
         if pct.mime == "text/plain" || pct.mime.startsWith "multipart/" then
@@ -348,23 +380,123 @@ partial def extractText (hs : Headers) (body : String) (depth : Nat := 8) : Opti
     let text := text.replace "\r\n" "\n"
     some (if ct.mime == "text/html" then htmlToText text else text.trimAscii.toString)
   else none
+
+/-! ## Attachments -/
+
+/-- Undo `%XX` escapes (RFC 2231's extended values); anything else is kept as its byte. -/
+def percentDecode (s : String) : ByteArray :=
+  go s.toList ByteArray.empty
 where
-  /-- The parts between `--boundary` delimiter lines, excluding preamble and epilogue. -/
-  splitMultipart (body boundary : String) : List String :=
-    let delim := "--" ++ boundary
-    let lines := body.splitOn "\n"
-    let (_, parts, cur, _) := lines.foldl (fun (st : Bool × List String × List String × Bool) line =>
-      let (inPart, parts, cur, done) := st
-      if done then st else
-      let l := if line.endsWith "\r" then (line.dropEnd 1).toString else line
-      if l == delim ++ "--" then
-        (false, (if inPart then ("\n".intercalate cur.reverse) :: parts else parts), [], true)
-      else if l == delim then
-        (true, (if inPart then ("\n".intercalate cur.reverse) :: parts else parts), [], false)
-      else if inPart then (inPart, parts, line :: cur, false)
-      else st) (false, [], [], false)
-    let parts := if !cur.isEmpty then ("\n".intercalate cur.reverse) :: parts else parts
-    parts.reverse
+  go : List Char → ByteArray → ByteArray
+    | [], out => out
+    | '%' :: a :: b :: rest, out =>
+      match hexValue a, hexValue b with
+      | some x, some y => go rest (out.push (UInt8.ofNat (x * 16 + y)))
+      | _, _ => go (a :: b :: rest) (out.push '%'.toNat.toUInt8)
+    | c :: rest, out => go rest (out ++ toBytes c.toString)
+
+/-- A parameter's value, decoded. RFC 2231 first -- `name*=utf-8''%C3%A4.pdf`, or split into
+    `name*0*`, `name*1`, ... -- else the plain `name`, with RFC 2047 encoded words decoded, which
+    is not what the standard allows in a parameter but what most mail programs send. -/
+def paramValue (ct : ContentType) (name : String) : Option String :=
+  if let some v := ct.param? (name ++ "*") then some (extended v)
+  else
+    let pieces := (List.range 64).map fun i =>
+      ((ct.param? s!"{name}*{i}*").map (·, true)).orElse fun _ =>
+        (ct.param? s!"{name}*{i}").map (·, false)
+    let pieces := pieces.takeWhile Option.isSome |>.filterMap id
+    match pieces with
+    | [] => (ct.param? name).map decodeHeader
+    | (first, encoded) :: rest =>
+      -- Only the first piece may say the charset, and only if it is an encoded one.
+      let (charset, first) := if encoded then charsetOf first else (none, first)
+      let bytes := ((first, encoded) :: rest).foldl (fun acc (v, enc) =>
+        acc ++ (if enc then percentDecode v else toBytes v)) ByteArray.empty
+      match charset with
+      | some cs => some (decodeCharset cs bytes)
+      | none => some (decodeHeader (latin1 bytes))
+where
+  /-- `charset'language'value` -> the charset (if given) and the value. -/
+  charsetOf (v : String) : Option String × String :=
+    match v.splitOn "'" with
+    | cs :: _ :: rest@(_ :: _) => (if cs.isEmpty then none else some cs, "'".intercalate rest)
+    | _ => (none, v)
+  extended (v : String) : String :=
+    let (cs, value) := charsetOf v
+    decodeCharset (cs.getD "utf-8") (percentDecode value)
+
+/-- A file name as a sender gave it, made safe to show and to save under: no directories, no
+    control characters. -/
+def cleanFileName (name : String) : Option String :=
+  let base := ((name.splitOn "/").getLast!.splitOn "\\").getLast!
+  let base := String.ofList (base.toList.filter fun c => c.toNat ≥ 0x20 && c.toNat != 0x7F)
+  let base := base.trimAscii.toString
+  if base.isEmpty || base == "." || base == ".." then none else some base
+
+/-- A leaf part that is an attachment, with what it takes to decode it. -/
+structure AttachmentPart where
+  info : Attachment
+  encoding : String
+  body : String
+
+/-- The decoded size of a part's body, without decoding it where that can be avoided. -/
+def decodedSize (encoding body : String) : Nat :=
+  match encoding.toLower.trimAscii.toString with
+  | "base64" =>
+    -- Four characters of the alphabet per three bytes; `=` padding is not in it.
+    (body.foldl (fun n c => if c != '=' && (b64Value c).isSome then n + 1 else n) 0) * 3 / 4
+  | "quoted-printable" => (quotedPrintableDecode body).size
+  | _ => body.length
+
+/-- The attachments of a MIME entity, in the order they appear: every leaf that is not the text
+    of the message. That is a part sent as an attachment, or one with a file name, or one that is
+    neither plain text nor HTML -- an inline image, a calendar invitation, a forwarded message.
+    `partial` is set on the last part of a multipart that never closed, which is where a message
+    that was cut off ends; whether it *was* cut off only the caller knows. -/
+partial def attachmentParts (hs : Headers) (body : String) (unclosed : Bool := true)
+    (depth : Nat := 8) : Array AttachmentPart :=
+  let ct := parseContentType ((hs.get? "content-type").getD "text/plain")
+  if ct.mime.startsWith "multipart/" then
+    if depth == 0 then #[] else
+    match ct.param? "boundary" with
+    | none => #[]
+    | some boundary =>
+      let (parts, closed) := splitMultipart body boundary
+      let n := parts.length
+      (parts.toArray.mapIdx fun i p =>
+        let (h, b) := splitPart p
+        attachmentParts h b (!closed && i + 1 == n) (depth - 1)).flatten
+  else
+    let disposition := parseContentType ((hs.get? "content-disposition").getD "inline")
+    let name := ((paramValue disposition "filename").orElse fun _ => paramValue ct "name")
+      |>.bind cleanFileName
+    let text := ct.mime == "text/plain" || ct.mime == "text/html"
+    if text && disposition.mime != "attachment" && name.isNone then #[] else
+    let encoding := (hs.get? "content-transfer-encoding").getD "7bit"
+    #[{ info := { name := name.getD "", mime := ct.mime, size := decodedSize encoding body
+                  «partial» := unclosed }
+        encoding, body }]
+
+/-- The attachments of a message, given its headers and body, with the unnamed ones named by their
+    position. -/
+def namedAttachments (hs : Headers) (body : String) : Array AttachmentPart :=
+  (attachmentParts hs body).mapIdx fun i p =>
+    if !p.info.name.isEmpty then p else
+    let ext := match p.info.mime with
+      | "message/rfc822" => ".eml"
+      | "text/calendar" => ".ics"
+      | _ => ""
+    { p with info := { p.info with name := s!"attachment-{i + 1}{ext}" } }
+
+/-- The attachments of a raw message. -/
+def messageAttachments (raw : String) : Array AttachmentPart :=
+  let (block, body) := splitHeaderBody raw
+  namedAttachments (parseHeaders block) body
+
+/-- Attachment `i` of a raw message and its decoded content. -/
+def attachmentAt (raw : String) (i : Nat) : Option (Attachment × ByteArray) := do
+  let p ← (messageAttachments raw)[i]?
+  return (p.info, decodeTransfer p.encoding p.body)
 
 /-! ## Addresses and dates -/
 
@@ -422,6 +554,8 @@ structure Message where
   /-- The thread root: the first `References` id, else `In-Reply-To`, else the message itself. -/
   threadKey : Option String
   text : String
+  /-- `partial` marks the last part of a multipart that never closed; see `attachmentParts`. -/
+  attachments : Array Attachment := #[]
 deriving Repr, Inhabited
 
 /-- The `<…>` message ids in a header value, in order. -/
@@ -430,6 +564,10 @@ def messageIds (v : String) : List String :=
     match chunk.splitOn ">" with
     | id :: _ :: _ => if id.isEmpty then none else some id
     | _ => none
+
+/-- The `Message-ID` of a raw message, from its header alone. -/
+def messageIdOf (raw : String) : Option String :=
+  (messageIds (((parseHeaders (splitHeaderBody raw).1).get? "message-id").getD "")).head?
 
 /-- Parse a raw message (a byte string). -/
 def parseMessage (raw : String) : Message :=
@@ -446,6 +584,7 @@ def parseMessage (raw : String) : Message :=
     to := hdr "to"
     date := (hs.get? "date").bind parseDate
     threadKey
-    text := (extractText hs body).getD "" }
+    text := (extractText hs body).getD ""
+    attachments := (namedAttachments hs body).map (·.info) }
 
 end Angelia.Mail

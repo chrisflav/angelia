@@ -228,7 +228,7 @@ def upsertNotification (db : Conn) (rawId : Int) (source externalId : String)
   let threadKey := n.threadKey.map (Vault.keyedId k source)
   let content ← Vault.seal k (contentAad source kid) (Json.mkObj [("externalId", externalId),
     ("author", n.author), ("title", n.title), ("body", n.body), ("url", toJson n.url),
-    ("threadKey", toJson n.threadKey)]).compress
+    ("threadKey", toJson n.threadKey), ("attachments", toJson n.attachments)]).compress
   let sentAt := n.sentAt.map i64
   let rows ← (← db query!"INSERT INTO notification
       (raw_id, source, external_id, kind, thread_key, content, sent_at, received_at, read, archived)
@@ -245,14 +245,22 @@ private def openRaw (k : Vault.Keys) (source kid : String) (payload : ByteArray)
   return (← IO.ofExcept (j.getObjValAs? String "externalId"),
     (j.getObjVal? "payload").toOption.getD .null)
 
-/-- Every raw event of a source (or of all sources), oldest first, for replay. -/
-def rawEvents (db : Conn) (source : Option String) :
-    IO (Array (Int × String × String × Int × Json)) := do
+/-- The ids of the raw events of a source (or of all sources) after id `after`, oldest first, at
+    most `limit`. Replay pages through ids and reads the events one by one (`rawEvent`), since an
+    event can be a whole message with its attachments. -/
+def rawEventIds (db : Conn) (source : Option String) (after : Int) (limit : Nat) :
+    IO (Array Int) := do
+  let rows ← (← db query!"SELECT id FROM raw_event
+    WHERE ({source} IS NULL OR source = {source}) AND id > {i64 after} ORDER BY id
+    LIMIT {Int64.ofNat limit}" as Int64).toArray
+  return rows.map (·.toInt)
+
+/-- A raw event, decrypted: `(id, source, externalId, receivedAt, payload)`. -/
+def rawEvent (db : Conn) (id : Int) : IO (Option (Int × String × String × Int × Json)) := do
   let k ← Vault.keys
   let rows ← (← db query!"SELECT id, source, external_id, received_at, payload FROM raw_event
-    WHERE {source} IS NULL OR source = {source} ORDER BY id"
-    as (Int64 × String × String × Int64 × ByteArray)).toArray
-  rows.mapM fun (a, src, kid, d, payload) => do
+    WHERE id = {i64 id}" as (Int64 × String × String × Int64 × ByteArray)).toArray
+  rows[0]?.mapM fun (a, src, kid, d, payload) => do
     let (externalId, p) ← openRaw k src kid payload
     return (a.toInt, src, externalId, d.toInt, p)
 
@@ -281,7 +289,8 @@ private def NotificationRow.decrypt (k : Vault.Keys) (r : NotificationRow) :
   return ((str "externalId").getD "",
     { kind := r.kind, threadKey := str "threadKey", author := (str "author").getD ""
       title := (str "title").getD "", body := (str "body").getD "", url := str "url"
-      sentAt := r.sentAt.map (·.toInt), read := r.read })
+      sentAt := r.sentAt.map (·.toInt), read := r.read
+      attachments := (j.getObjValAs? (Array Attachment) "attachments").toOption.getD #[] })
 
 /-- As the API shows it. The thread key is the keyed hash, which groups just as well. -/
 private def NotificationRow.toNotification (k : Vault.Keys) (r : NotificationRow) :
@@ -350,8 +359,8 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
       CASE WHEN {f.sort} = 'oldest' THEN id ELSE -id END
     LIMIT {limit}" as NotificationRow).toArray
 
-/-- Run a notification query, newest first. A text search (case-insensitive, on title, body and
-    author) decrypts candidates page by page until it has `limit` matches. -/
+/-- Run a notification query, newest first. A text search (case-insensitive, on title, body,
+    author and attachment names) decrypts candidates page by page until it has `limit` matches. -/
 def listNotifications (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notification) := do
   let k ← Vault.keys
   let limit := min f.limit 500
@@ -365,7 +374,8 @@ def listNotifications (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notif
     for r in rows do
       let n ← r.toNotification k
       let hit (s : String) := (s.toLower.splitOn q).length > 1
-      if out.size < limit && (hit n.data.title || hit n.data.body || hit n.data.author) then
+      if out.size < limit && (hit n.data.title || hit n.data.body || hit n.data.author
+          || n.data.attachments.any (hit ·.name)) then
         out := out.push n
     if rows.size < pageSize || out.size ≥ limit then break
     f := { f with before := rows.back?.map fun r => (r.time.toInt, r.id.toInt) }

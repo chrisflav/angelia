@@ -128,15 +128,22 @@ def replay (db : Db.Conn) (normalizerFor : String → Option Normalizer) (source
     IO (Nat × Nat) := Db.withTransaction db do
   let mut ok := 0
   let mut failed := 0
-  for (rawId, src, externalId, receivedAt, payload) in ← Db.rawEvents db source do
-    let some normalize := normalizerFor src | failed := failed + 1; continue
-    match normalize payload with
-    | .ok n =>
-      discard <| Db.upsertNotification db rawId src externalId n receivedAt n.read false
-      ok := ok + 1
-    | .error e =>
-      log "replay" s!"{src}/{externalId}: {e}"
-      failed := failed + 1
+  let mut after := 0
+  -- One event at a time, so only one is ever decrypted at once: it can be a whole message.
+  repeat
+    let page ← Db.rawEventIds db source after 1000
+    for id in page do
+      let some (rawId, src, externalId, receivedAt, payload) ← Db.rawEvent db id | continue
+      let some normalize := normalizerFor src | failed := failed + 1; continue
+      match normalize payload with
+      | .ok n =>
+        discard <| Db.upsertNotification db rawId src externalId n receivedAt n.read false
+        ok := ok + 1
+      | .error e =>
+        log "replay" s!"{src}/{externalId}: {e}"
+        failed := failed + 1
+    let some last := page.back? | break
+    after := last
   return (ok, failed)
 
 end Angelia

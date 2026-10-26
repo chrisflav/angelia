@@ -160,6 +160,8 @@ structure Fetched where
   internalDate : Option String := none
   /-- `BODY[]` (or a partial `BODY[]<0>`), as a byte string. -/
   body : Option String := none
+  /-- `RFC822.SIZE`: the whole message's size in bytes. -/
+  size : Option Nat := none
 deriving Repr, Inhabited
 
 /-- Interpret `* n FETCH (...)`. -/
@@ -176,6 +178,7 @@ def Response.fetch? (r : Response) : Option Fetched := do
     if key == "UID" then f := { f with uid := v.nat? }
     else if key == "FLAGS" then f := { f with flags := (v.list?.getD #[]).filterMap Value.text? }
     else if key == "INTERNALDATE" then f := { f with internalDate := v.text? }
+    else if key == "RFC822.SIZE" then f := { f with size := v.nat? }
     else if key.startsWith "BODY[]" || key == "RFC822" then f := { f with body := v.text? }
     i := i + 2
   return f

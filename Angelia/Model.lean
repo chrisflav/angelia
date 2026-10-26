@@ -20,6 +20,17 @@ structure RawEvent where
   payload : Json
 deriving Inhabited
 
+/-- A file that came with a notification, as listed; the content stays in the raw event and is
+    extracted from it when asked for (see `Angelia.Mail.attachmentAt`). -/
+structure Attachment where
+  name : String
+  mime : String
+  /-- Decoded size in bytes, from the encoded length: exact for base64, close otherwise. -/
+  size : Nat
+  /-- Cut off, because the message was larger than what was fetched of it. -/
+  «partial» : Bool := false
+deriving Inhabited, Repr, BEq, ToJson, FromJson
+
 /-- The canonical fields every source normalises into. -/
 structure NotificationData where
   /-- Kind of item within the source, e.g. `mail`, `PullRequest`, `Issue`. -/
@@ -35,6 +46,8 @@ structure NotificationData where
   sentAt : Option Int := none
   /-- Whether the source already considers it read. -/
   read : Bool := false
+  /-- Only mail has them, and only what the mail's raw event can be asked for again. -/
+  attachments : Array Attachment := #[]
 deriving Inhabited, Repr, ToJson
 
 /-- Every field is optional except `title`, so a pushing program sends only what it has. -/
@@ -74,7 +87,7 @@ instance : ToJson Notification where
     ("title", n.data.title), ("body", n.data.body), ("url", toJson n.data.url),
     ("sentAt", toJson n.data.sentAt), ("receivedAt", n.receivedAt), ("read", n.read),
     ("archived", n.archived), ("starred", n.starred), ("labels", toJson n.labels),
-    ("time", n.time)]
+    ("attachments", toJson n.data.attachments), ("time", n.time)]
 
 /-- A user-defined label. Labels are how notifications are organised, independently of where they
     came from. -/

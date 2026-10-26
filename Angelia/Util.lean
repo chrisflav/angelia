@@ -10,12 +10,14 @@ namespace Angelia
 /-- Read bytes as Latin-1: one character per byte. Lossless, which is what makes it the right way
     to hold protocol data (mail, IMAP lines) whose character set is not yet known. -/
 def latin1 (b : ByteArray) : String :=
-  String.ofList (b.toList.map fun x => Char.ofNat x.toNat)
+  -- Folds, here and in `toBytes`, rather than through a `List Char`, which takes a list cell per
+  -- byte: a whole message with its attachments goes through these.
+  b.foldl (fun s x => s.push (Char.ofNat x.toNat)) ""
 
 /-- Inverse of `latin1` for byte strings; characters above U+00FF are written as UTF-8. -/
 def toBytes (s : String) : ByteArray :=
-  s.toList.foldl (fun out c => if c.toNat < 256 then out.push c.toNat.toUInt8
-    else out ++ c.toString.toUTF8) ByteArray.empty
+  s.foldl (fun out c => if c.toNat < 256 then out.push c.toNat.toUInt8
+    else out ++ c.toString.toUTF8) (ByteArray.emptyWithCapacity s.utf8ByteSize)
 
 /-- Current Unix time in seconds. -/
 def nowSeconds : IO Int := do
