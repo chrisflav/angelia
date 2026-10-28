@@ -524,6 +524,9 @@ def ingest (ctx : AppContext) (sourceName : String) (r : Req) : ApiM ApiResponse
     cctx.ingest events
   ok (Json.mkObj [("received", events.size), ("new", n)])
 
+/-- The first path segments of the routes only a logged-in session may use. -/
+def sessionOnly : List String := ["second-factors", "tokens", "labels", "rules", "views"]
+
 def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   match r.method, r.segments with
   | .post, ["login"] => login ctx r
@@ -548,7 +551,7 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
   | .get, ["notifications"] => listNotifications ctx scope r
   | .patch, ["notifications"] => requireWrite; patchNotifications ctx scope r
   | .get, ["notifications", id] =>
-    getNotification ctx scope (← parseId id) (r.query "raw" == some "1")
+    getNotification ctx scope (← parseId id) (["1", "true"].contains ((r.query "raw").getD ""))
   | .get, ["notifications", id, "attachments", n] =>
     getAttachment ctx scope (← parseId id) (← parseId n)
   | .put, ["notifications", id, "labels", label] =>
@@ -560,6 +563,9 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
     ok (toJson ((← ctx.dbM Db.listLabels).filter (scope.allowsLabel ·.id)))
   | .get, ["sources"] => sources ctx scope
   | _, _ =>
+  -- Past here only the owner's settings. A path that is not one of them is unknown to a token
+  -- as much as to a session, and said so: a 403 would read as "tokens may not do this".
+  if !sessionOnly.contains (r.segments.headD "") then fail (.notFound "no such endpoint")
   requireSession
   match r.method, r.segments with
   | .get, ["second-factors"] => ok (← ctx.dbM Db.listFactors)
