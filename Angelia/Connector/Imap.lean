@@ -1,6 +1,7 @@
 import Angelia.Ingest
 import Angelia.Imap.Client
-import Angelia.Mail.Mime
+import Angelia.Mail.Compose
+import Angelia.Smtp
 import Angelia.OAuth2
 import Std.Sync.Mutex
 
@@ -30,6 +31,21 @@ access tokens are cached until shortly before they expire, and a rotated refresh
 (encrypted) in the database, preferred over the configured one, which stays the fallback. Further:
 `folders` (`["INBOX"]`), `initialSync` (50), `maxBytes` (52428800), `idleMinutes` (5), `pollSeconds`
 (120, without `IDLE`), `transport` (argv, overrides the TLS transport — for tests).
+
+## Sent mail, and sending
+
+The sent folder is watched too (`syncSent`, on by default): the mailbox the server flags `\Sent`
+(RFC 6154), or `sentFolder` by name. What it holds is stored as *outgoing* -- out of the inbox,
+in its conversation -- so what was sent from any mail program shows.
+
+With `smtp` settings a source can send, replies and new messages alike (`send`): by SMTP
+submission, from `address` (default: the username) as `displayName`, then into the sent folder
+with `APPEND` (`smtp.saveSent`, on by default; off for Gmail and Microsoft 365, which file what
+they send themselves). `smtp` takes `host`, `port` (465, or 587 with `tls: "starttls"`), `tls`,
+and `username` and `password` / `passwordCommand`, which default to the account's own. An OAuth
+account sends with a token from the same refresh token, for `smtp.oauth2Scope` (default: the
+account's scope) -- Microsoft 365 wants `https://outlook.office.com/SMTP.Send offline_access`,
+which the refresh token must have been granted, and SMTP AUTH enabled for the mailbox.
 -/
 
 open Lean Angelia.Imap
@@ -40,12 +56,29 @@ namespace Angelia.Connector.ImapSource
     server sends anyway. A larger one is stored cut off there, and marked `truncated`. -/
 def defaultMaxBytes : Nat := 50 * 1024 * 1024
 
+/-- How mail is sent from the account, where it can be. -/
+structure Smtp where
+  transport : Transport
+  credentials : IO Conn.Credentials
+  /-- Put a copy of what is sent into the sent folder, as mail programs do. Off for a server
+      that does it itself (Gmail, Microsoft 365), which would otherwise keep two. -/
+  saveSent : Bool
+
 structure Settings where
   transport : Transport
   username : String
   /-- Looked up on every connect, so a token helper can hand out fresh tokens. -/
   credentials : IO Conn.Credentials
   folders : Array String
+  /-- What mail is sent from (`address`, else the username), and the name it carries
+      (`displayName`). -/
+  address : String
+  name : String
+  /-- Also watch the sent folder, so that what is sent from anywhere shows, as sent. -/
+  syncSent : Bool
+  /-- The sent folder by name, for a server that flags none `\Sent`. -/
+  sentFolder : Option String
+  smtp : Option Smtp
   initialSync : Nat
   maxBytes : Nat
   idleMinutes : Nat
@@ -77,29 +110,66 @@ def oauth2Credentials (source : String) (dbPath : System.FilePath) (j : Json) (u
       | .error e => errors := errors.push e
     throw (IO.userError s!"imap: token refresh failed: {"; ".intercalate errors.toList}")
 
-def Settings.load (source : String) (dbPath : System.FilePath) (j : Json) : IO Settings := do
+/-- Where a server is, from `host`, `port` and `tls` in `j` (or `transport`, for tests). -/
+def transportOf (what : String) (j : Json) (implicitPort starttlsPort : Nat) : IO Transport := do
   let get {α} [FromJson α] (k : String) (d : α) : α := (j.getObjValAs? α k).toOption.getD d
-  let host : String := get "host" ""
-  let port : Nat := get "port" (if get "tls" "implicit" == "starttls" then 143 else 993)
-  let transport ← match j.getObjValAs? (Array String) "transport" with
-    | .ok argv => pure (Transport.command argv)
-    | .error _ =>
-      if host.isEmpty then throw (IO.userError "imap: 'host' is required")
-      pure (if (get "tls" "implicit" : String) == "starttls" then .startTls host port else .implicitTls host port)
+  let starttls := (get "tls" "implicit" : String) == "starttls"
+  match j.getObjValAs? (Array String) "transport" with
+  | .ok argv => pure (Transport.command argv)
+  | .error _ =>
+    let host : String := get "host" ""
+    if host.isEmpty then throw (IO.userError s!"{what}: 'host' is required")
+    let port : Nat := get "port" (if starttls then starttlsPort else implicitPort)
+    pure (if starttls then .startTls host port else .implicitTls host port)
+
+/-- How to log in as `username`: with `oauth`, tokens from the refresh token; else the secret in
+    `j` (an access token or a password), falling back to the account's own in `account`, which
+    is how the SMTP side shares the IMAP password unless it is given another. -/
+def credentialsFor (source : String) (dbPath : System.FilePath) (j account : Json)
+    (username : String) (oauth : Option OAuth2.Client) : IO (IO Conn.Credentials) :=
+  match oauth with
+  | some client => oauth2Credentials source dbPath account username client
+  | none => pure do
+    let first (k : String) : IO (Option String) := do
+      if let some v ← secret j k then return some v
+      secret account k
+    if let some token ← first "accessToken" then return .oauth2 username token
+    let some password ← first "password"
+      | throw (IO.userError
+          "imap: 'password', 'passwordCommand', 'accessTokenCommand' or 'oauth2' is required")
+    return .password username password
+
+/-- The address the account sends from: `address`, else the username. -/
+def ownAddress (j : Json) : String :=
+  ((j.getObjValAs? String "address").toOption.filter (!·.isEmpty)).getD
+    ((j.getObjValAs? String "username").toOption.getD "")
+
+def Settings.load (source : String) (dbPath : System.FilePath) (j : Json)
+    (checkCredentials := true) : IO Settings := do
+  let get {α} [FromJson α] (k : String) (d : α) : α := (j.getObjValAs? α k).toOption.getD d
+  let transport ← transportOf "imap" j 993 143
   let username : String := get "username" ""
-  let credentials : IO Conn.Credentials ← match j.getObjValAs? OAuth2.Client "oauth2" with
-    | .ok client => oauth2Credentials source dbPath j username client
-    | .error _ => pure do
-      if let some token ← secret j "accessToken" then return .oauth2 username token
-      let some password ← secret j "password"
-        | throw (IO.userError
-            "imap: 'password', 'passwordCommand', 'accessTokenCommand' or 'oauth2' is required")
-      return .password username password
+  let oauth := (j.getObjValAs? OAuth2.Client "oauth2").toOption
+  let credentials ← credentialsFor source dbPath j j username oauth
   -- Fail at startup, not on the first connect, if the secret cannot be had at all.
-  let _ ← credentials
+  if checkCredentials then discard credentials
+  let smtp ← match j.getObjVal? "smtp" with
+    | .ok sj@(.obj _) => do
+      let sget {α} [FromJson α] (k : String) (d : α) : α := (sj.getObjValAs? α k).toOption.getD d
+      let smtpUser : String := sget "username" username
+      -- The same OAuth client, for a token SMTP accepts: Microsoft wants another scope.
+      let soauth := oauth.map fun c => { c with scope := sget "oauth2Scope" c.scope }
+      pure (some { transport := ← transportOf "smtp" sj 465 587
+                   credentials := ← credentialsFor source dbPath sj j smtpUser soauth
+                   saveSent := sget "saveSent" true : Smtp })
+    | _ => pure none
   return {
-    transport, username, credentials
+    transport, username, credentials, smtp
+    address := ownAddress j
+    name := get "displayName" ""
     folders := get "folders" #["INBOX"]
+    syncSent := get "syncSent" true
+    sentFolder := (j.getObjValAs? String "sentFolder").toOption
     initialSync := get "initialSync" 50
     maxBytes := get "maxBytes" defaultMaxBytes
     idleMinutes := get "idleMinutes" 5
@@ -115,7 +185,11 @@ def normalize (payload : Json) : Except String NotificationData := do
   let flags := (payload.getObjValAs? (Array String) "flags").toOption.getD #[]
   let internalDate := (payload.getObjValAs? String "internalDate").toOption
   let truncated := (payload.getObjValAs? Bool "truncated").toOption.getD false
+  let outgoing := (payload.getObjValAs? Bool "outgoing").toOption.getD false
   let m := Mail.parseMessage raw
+  let hs := Mail.parseHeaders (Mail.splitHeaderBody raw).1
+  let recipients := #["to", "cc"].flatMap fun h => Mail.parseAddressList ((hs.get? h).getD "")
+    |>.map fun a => if a.name.isEmpty then a.addr else a.name
   -- INTERNALDATE is `17-Jul-1996 02:44:25 -0700`; `parseDate` reads it once the dashes go.
   let sentAt := m.date.orElse fun _ => internalDate.bind fun d => Mail.parseDate (d.replace "-" " " |>.replace "  " " -")
   return {
@@ -126,9 +200,12 @@ def normalize (payload : Json) : Except String NotificationData := do
     body := truncate m.text maxBodyChars
     url := none
     sentAt
-    read := flags.contains "\\Seen"
+    -- What the account sent is read, whatever the server's flags say.
+    read := outgoing || flags.contains "\\Seen"
     -- The parser marks the part a cut would fall in; whether there was a cut is known here.
-    attachments := m.attachments.map fun a => { a with «partial» := truncated && a.partial } }
+    attachments := m.attachments.map fun a => { a with «partial» := truncated && a.partial }
+    outgoing
+    recipients := ", ".intercalate recipients.toList }
 
 /-- The dedupe key: the `Message-ID` where there is one, else the message's position. -/
 def externalId (folder : String) (uidValidity : Nat) (f : Fetched) : String :=
@@ -137,13 +214,16 @@ def externalId (folder : String) (uidValidity : Nat) (f : Fetched) : String :=
   | some id => s!"mid:{id}"
   | none => s!"uid:{folder}/{uidValidity}/{f.uid.getD f.seq}"
 
-def toRawEvent (folder : String) (uidValidity maxBytes : Nat) (f : Fetched) : RawEvent :=
+/-- The raw event of a fetched message; `outgoing` for one from the sent folder. -/
+def toRawEvent (folder : String) (uidValidity maxBytes : Nat) (outgoing : Bool) (f : Fetched) :
+    RawEvent :=
   let raw := f.body.getD ""
   { externalId := externalId folder uidValidity f
-    payload := Json.mkObj [
+    payload := Json.mkObj (([
       ("folder", folder), ("uid", toJson f.uid), ("uidValidity", uidValidity),
       ("flags", toJson f.flags), ("internalDate", toJson f.internalDate),
-      ("truncated", decide (raw.length ≥ maxBytes)), ("raw", raw)] }
+      ("truncated", decide (raw.length ≥ maxBytes)), ("raw", raw)] : List (String × Json)) ++
+      (if outgoing then [("outgoing", toJson true)] else [])) }
 
 /-! ## Sync -/
 
@@ -185,7 +265,8 @@ def uidSet (uids : Array Nat) : String :=
     moving past each batch once it is stored. So a first sync of thousands of messages takes a
     bounded amount of memory, and one interrupted halfway -- the connection dropped, the server
     restarted -- carries on where it stopped. Returns the number of new events. -/
-def syncFolder (ctx : ConnectorCtx) (s : Settings) (c : Conn) (folder : String) : IO Nat := do
+def syncFolder (ctx : ConnectorCtx) (s : Settings) (c : Conn) (folder : String)
+    (outgoing : Bool := false) : IO Nat := do
   let mb ← c.examine folder
   let cursor ← ctx.getCursor folder
   let known := cursor.bind fun j => do
@@ -213,7 +294,8 @@ def syncFolder (ctx : ConnectorCtx) (s : Settings) (c : Conn) (folder : String) 
   for batch in batches do
     if ← ctx.stopping then break
     let fetched ← c.fetch (uidSet batch) true s.maxBytes
-    fresh := fresh + (← ctx.ingest (fetched.map (toRawEvent folder mb.uidValidity s.maxBytes)))
+    let events := fetched.map (toRawEvent folder mb.uidValidity s.maxBytes outgoing)
+    fresh := fresh + (← ctx.ingest events)
     -- Past the whole batch, a message expunged meanwhile included; and only once the batch is
     -- committed, so a crash in between re-fetches it, which the dedupe absorbs.
     cursorAt batch.back!
@@ -245,17 +327,39 @@ def idleWatchdog (ctx : ConnectorCtx) (c : Conn) (generation : IO.Ref Nat) (minu
       ctx.log "server did not complete IDLE, dropping the connection"
       c.close
 
+/-- What a worker watches: a folder by name, or the account's sent folder, whatever the server
+    calls it (`sentFolder`, else the mailbox it flags `\Sent`), looked up on every connect. -/
+inductive Target where
+  | folder (name : String)
+  | sent
+
+/-- The sent folder's name, if the account has one. -/
+def sentFolderOf (s : Settings) (c : Conn) : IO (Option String) := do
+  if let some f := s.sentFolder then return some f
+  return sentMailbox? (← c.list)
+
 /-- One connection's lifetime: connect, then sync and wait for changes until something fails. -/
-partial def session (ctx : ConnectorCtx) (s : Settings) (folder : String) : IO Unit := do
-  ctx.health "connecting" (some folder)
+partial def session (ctx : ConnectorCtx) (s : Settings) (target : Target) : IO Unit := do
+  let label := match target with | .folder f => f | .sent => "sent folder"
+  ctx.health "connecting" (some label)
   let c ← Conn.open s.transport
   try
     c.login (← s.credentials)
+    let folder ← match target with
+      | .folder f => pure (some f)
+      | .sent => sentFolderOf s c
+    -- No sent folder, or one already watched as an ordinary folder: nothing to do here. Asked
+    -- again in a while, since a mail program may create one.
+    let some folder := folder.filter (fun f => !(target matches .sent) || !s.folders.contains f)
+      | c.logout
+        discard <| ctx.sleep (6 * 3600)
+        return
+    let outgoing := target matches .sent
     let canIdle ← c.hasCap "IDLE"
     let generation ← IO.mkRef 0
     let rec loop : IO Unit := do
       if ← ctx.stopping then return
-      let n ← syncFolder ctx s c folder
+      let n ← syncFolder ctx s c folder outgoing
       if n > 0 then ctx.log s!"{folder}: {n} new"
       if canIdle then
         ctx.health "ok" (some s!"{folder}: idle")
@@ -274,12 +378,68 @@ partial def session (ctx : ConnectorCtx) (s : Settings) (folder : String) : IO U
 
 def run (ctx : ConnectorCtx) : IO Unit := do
   let s ← Settings.load ctx.name ctx.dbPath ctx.source.settings
-  let workers ← s.folders.mapM fun folder => do
+  let targets := s.folders.map Target.folder ++ (if s.syncSent then #[Target.sent] else #[])
+  let workers ← targets.mapM fun target => do
     let wctx ← ctx.fork
-    IO.asTask (prio := .dedicated) (wctx.supervise (session wctx s folder))
+    IO.asTask (prio := .dedicated) (wctx.supervise (session wctx s target))
   for w in workers do
     match ← IO.wait w with
     | .ok _ => pure ()
     | .error e => ctx.log s!"worker ended: {e}"
+
+/-! ## Sending -/
+
+/-- Whether a source can send: it has `smtp` settings. -/
+def canSend (source : SourceConfig) : Bool :=
+  source.settings.getObjVal? "smtp" matches .ok (.obj _)
+
+/-- Put a sent message into the sent folder. Returns the folder, or `none` if there is none. -/
+def saveToSent (s : Settings) (message : String) : IO (Option String) := do
+  let c ← Conn.open s.transport
+  try
+    c.login (← s.credentials)
+    let some folder ← sentFolderOf s c | c.logout; return none
+    c.append folder message
+    c.logout
+    return some folder
+  catch e =>
+    c.close
+    throw e
+
+/-- Send a draft from the account by SMTP, in reply to the message whose raw payload is given, if
+    one is: `In-Reply-To` and `References` keep it in its thread. A copy goes into the sent folder
+    (`saveSent`); failing that is logged, not thrown, since the message is sent by then. Returns
+    the raw event of the message as sent, to be stored as an outgoing one -- the same event, by
+    its `Message-ID`, that syncing the sent folder finds later. -/
+def send (source : SourceConfig) (dbPath : System.FilePath) (d : Draft) (original : Option Json) :
+    IO RawEvent := do
+  let s ← Settings.load source.name dbPath source.settings (checkCredentials := false)
+  let some smtp := s.smtp
+    | throw (IO.userError s!"source '{source.name}' cannot send: it has no 'smtp' settings")
+  let recipients := d.recipients.map (·.addr)
+  if recipients.isEmpty then throw (IO.userError "a message needs at least one recipient")
+  let raw := original.bind (·.getObjValAs? String "raw" |>.toOption)
+  let (inReplyTo, references) := (raw.map Mail.replyThreading).getD (none, [])
+  let sender : Mail.Address := { name := s.name, addr := s.address }
+  let messageId := s!"{← randomToken 16}@{sender.domain}"
+  let message := Mail.compose
+    { «from» := sender, date := ← nowSeconds, messageId, inReplyTo, references } d
+  Smtp.send smtp.transport (← smtp.credentials) s.address recipients message
+  let folder ← if !smtp.saveSent then pure none else
+    try saveToSent s message
+    catch e =>
+      Angelia.log source.name s!"sent, but not saved to the sent folder: {e}"
+      pure none
+  return { externalId := s!"mid:{messageId}"
+           payload := Json.mkObj [("folder", toJson folder), ("flags", toJson #["\\Seen"]),
+             ("outgoing", true), ("truncated", false), ("raw", message)] }
+
+/-- The prefilled reply to a mail, from its raw payload: to its sender (or `Reply-To`), and with
+    `all` to its other recipients too, never to the account itself. -/
+def replyDraft (source : SourceConfig) (payload : Json) (all : Bool) : Option Draft := do
+  let raw ← (payload.getObjValAs? String "raw").toOption
+  let own := [ownAddress source.settings,
+    (source.settings.getObjValAs? String "username").toOption.getD ""].filter (!·.isEmpty)
+  return Mail.replyDraft raw own all
 
 end Angelia.Connector.ImapSource

@@ -15,7 +15,9 @@
       "username": "me@example.org",
       "passwordCommand": ["pass", "show", "mail/imap"],
       "folders": ["INBOX"],
-      "initialSync": 50
+      "initialSync": 50,
+      "displayName": "Me Example",
+      "smtp": { "host": "smtp.example.org", "port": 465 }
     },
     {
       "name": "work-mail",

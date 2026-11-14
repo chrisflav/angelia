@@ -123,25 +123,35 @@ partial def supervise (c : ConnectorCtx) (body : IO Unit) : IO Unit := do
 end ConnectorCtx
 
 /-- Re-derive every notification from its raw event with the current normalisers. User state
-    (read/archived/starred, manual labels) is kept. Returns `(replayed, failed)`. -/
+    (read/archived/starred, manual labels) is kept. Returns `(replayed, failed)`.
+
+    A page of 200 events per transaction, not one for everything: with every message
+    stored whole that takes minutes, and the sources and the API go on writing meanwhile. A replay
+    cut short is simply run again. -/
 def replay (db : Db.Conn) (normalizerFor : String → Option Normalizer) (source : Option String) :
-    IO (Nat × Nat) := Db.withTransaction db do
+    IO (Nat × Nat) := do
   let mut ok := 0
   let mut failed := 0
   let mut after := 0
-  -- One event at a time, so only one is ever decrypted at once: it can be a whole message.
   repeat
-    let page ← Db.rawEventIds db source after 1000
-    for id in page do
-      let some (rawId, src, externalId, receivedAt, payload) ← Db.rawEvent db id | continue
-      let some normalize := normalizerFor src | failed := failed + 1; continue
-      match normalize payload with
-      | .ok n =>
-        discard <| Db.upsertNotification db rawId src externalId n receivedAt n.read false
-        ok := ok + 1
-      | .error e =>
-        log "replay" s!"{src}/{externalId}: {e}"
-        failed := failed + 1
+    let page ← Db.rawEventIds db source after 200
+    let (o, f) ← Db.withTransaction db do
+      let mut o := 0
+      let mut f := 0
+      -- One event at a time, so only one is ever decrypted at once: it can be a whole message.
+      for id in page do
+        let some (rawId, src, externalId, receivedAt, payload) ← Db.rawEvent db id | continue
+        let some normalize := normalizerFor src | f := f + 1; continue
+        match normalize payload with
+        | .ok n =>
+          discard <| Db.upsertNotification db rawId src externalId n receivedAt n.read false
+          o := o + 1
+        | .error e =>
+          log "replay" s!"{src}/{externalId}: {e}"
+          f := f + 1
+      return (o, f)
+    ok := ok + o
+    failed := failed + f
     let some last := page.back? | break
     after := last
   return (ok, failed)

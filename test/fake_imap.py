@@ -2,7 +2,8 @@
 """A minimal IMAP server for exercising angelia's IMAP connector end to end.
 
 Serves the ``*.eml`` files in a directory as INBOX, in name order, and notices new files while
-running: a client in IDLE gets ``* n EXISTS`` within a fraction of a second. Plain TCP; point the
+running: a client in IDLE gets ``* n EXISTS`` within a fraction of a second. A second folder,
+``Sent``, flagged ``\\Sent``, starts empty and takes what is APPENDed to it. Plain TCP; point the
 connector at it with ``"transport": ["nc", "127.0.0.1", "<port>"]``.
 
     fake_imap.py MAILDIR [PORT]
@@ -20,28 +21,30 @@ import time
 
 MAILDIR = sys.argv[1]
 PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 11143
-UIDVALIDITY = 1234
 
 lock = threading.Lock()
-messages = []  # (uid, bytes)
+# Folder name -> (UIDVALIDITY, attributes, [(uid, bytes)]).
+folders = {"INBOX": (1234, "", []), "Sent": (5678, " \\Sent", [])}
 seen_files = set()
-idlers = set()
+idlers = {}  # handler -> folder it is idling on
+
+
+def add(folder, data):
+    with lock:
+        msgs = folders[folder][2]
+        msgs.append(((msgs[-1][0] + 1) if msgs else 100, data))
+        count = len(msgs)
+    for h, f in list(idlers.items()):
+        if f == folder:
+            h.send(f"* {count} EXISTS\r\n".encode())
 
 
 def scan():
-    added = False
-    with lock:
-        for name in sorted(os.listdir(MAILDIR)):
-            if name.endswith(".eml") and name not in seen_files:
-                seen_files.add(name)
-                with open(os.path.join(MAILDIR, name), "rb") as f:
-                    data = f.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
-                messages.append((len(messages) + 100, data))
-                added = True
-        count = len(messages)
-    if added:
-        for h in list(idlers):
-            h.send(f"* {count} EXISTS\r\n".encode())
+    for name in sorted(os.listdir(MAILDIR)):
+        if name.endswith(".eml") and name not in seen_files:
+            seen_files.add(name)
+            with open(os.path.join(MAILDIR, name), "rb") as f:
+                add("INBOX", f.read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
 
 
 def watcher():
@@ -63,15 +66,20 @@ def parse_set(spec, values):
     return sorted(out)
 
 
+def mailbox(arg):
+    return arg.strip().strip('"')
+
+
 class Handler(socketserver.StreamRequestHandler):
     def send(self, data):
         try:
             self.wfile.write(data)
             self.wfile.flush()
         except OSError:
-            idlers.discard(self)
+            idlers.pop(self, None)
 
     def handle(self):
+        selected = "INBOX"
         self.send(b"* OK [CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN] fake ready\r\n")
         while True:
             line = self.rfile.readline()
@@ -90,18 +98,34 @@ class Handler(socketserver.StreamRequestHandler):
                 self.send(b"+ \r\n")
                 creds = base64.b64decode(self.rfile.readline().strip()).split(b"\0")
                 print("login", creds[1].decode(), file=sys.stderr)
+            elif cmd == "LIST":
+                for name, (_, attrs, _) in folders.items():
+                    self.send(f'* LIST (\\HasNoChildren{attrs}) "/" "{name}"\r\n'.encode())
             elif cmd in ("EXAMINE", "SELECT"):
+                selected = mailbox(args)
+                if selected not in folders:
+                    self.send(f"{tag} NO no such mailbox\r\n".encode())
+                    continue
                 with lock:
-                    n = len(messages)
-                    nxt = (messages[-1][0] + 1) if messages else 100
-                self.send(f"* {n} EXISTS\r\n* OK [UIDVALIDITY {UIDVALIDITY}] ok\r\n"
+                    validity, _, msgs = folders[selected]
+                    n = len(msgs)
+                    nxt = (msgs[-1][0] + 1) if msgs else 100
+                self.send(f"* {n} EXISTS\r\n* OK [UIDVALIDITY {validity}] ok\r\n"
                           f"* OK [UIDNEXT {nxt}] ok\r\n".encode())
+            elif cmd == "APPEND":
+                m = re.match(r'("[^"]*"|\S+) \(([^)]*)\) \{(\d+)\}$', args)
+                box = mailbox(m.group(1))
+                self.send(b"+ go ahead\r\n")
+                data = self.rfile.read(int(m.group(3)))
+                self.rfile.readline()  # the CRLF ending the command
+                add(box, data)
+                print("APPEND", box, len(data), file=sys.stderr, flush=True)
             elif cmd in ("FETCH", "UID FETCH"):
                 spec, _, items = args.partition(" ")
                 m = re.search(r"<0\.(\d+)>", items)
                 limit = int(m.group(1)) if m else None
                 with lock:
-                    snapshot = list(messages)
+                    snapshot = list(folders[selected][2])
                 by_uid = cmd == "UID FETCH"
                 keys = [u for u, _ in snapshot] if by_uid else list(range(1, len(snapshot) + 1))
                 for k in parse_set(spec, keys):
@@ -114,12 +138,12 @@ class Handler(socketserver.StreamRequestHandler):
                     self.send(f"* {seq} FETCH (UID {uid} FLAGS () INTERNALDATE "
                               f"\"20-Oct-2026 10:00:00 +0000\" BODY[]<0> {{{len(body)}}}\r\n"
                               .encode() + body + b")\r\n")
-                print(cmd, spec, items, file=sys.stderr, flush=True)
+                print(selected, cmd, spec, items, file=sys.stderr, flush=True)
             elif cmd == "IDLE":
                 self.send(b"+ idling\r\n")
-                idlers.add(self)
+                idlers[self] = selected
                 self.rfile.readline()  # DONE
-                idlers.discard(self)
+                idlers.pop(self, None)
             elif cmd == "LOGOUT":
                 self.send(b"* BYE\r\n")
                 self.send(f"{tag} OK bye\r\n".encode())

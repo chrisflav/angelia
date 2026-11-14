@@ -400,9 +400,19 @@ kbd { font-size: 11px; color: var(--muted); border: 1px solid var(--line); borde
 }
 .dialog::backdrop { background: rgb(0 0 0 / 0.35); }
 .dialog > * + *, .dialog > div > * + * { margin-top: 10px; }
+.dialog .buttons > * + * { margin-top: 0; }
 .dialog h2 { font-size: 16px; font-weight: 600; }
 .dialog p { margin: 0; }
 .dialog .form-row { grid-template-columns: 6rem 1fr; }
+.compose-dialog { width: min(760px, calc(100vw - 32px)); }
+.compose-dialog .form-row { margin-top: 6px; }
+.compose-dialog .form-field input:not([type="checkbox"]):not([type="radio"]) { width: 100%; }
+.compose-dialog textarea {
+  display: block; width: 100%; box-sizing: border-box; resize: vertical; font: inherit; line-height: 1.45;
+  color: var(--ink); background: var(--pane); border: 1px solid var(--line); border-radius: 4px; padding: 8px 10px;
+}
+.sidebar .compose { margin: 4px 8px 10px; justify-content: center; }
+.sidebar .compose kbd { color: inherit; border-color: currentColor; opacity: 0.7; }
 .qr { display: block; width: 180px; height: 180px; image-rendering: pixelated; background: #fff; padding: 6px; border-radius: 4px; }
 
 /* ---------- small screens ---------- */

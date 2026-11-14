@@ -14,7 +14,8 @@ server. TLS is left to a reverse proxy in front.
 Authentication is a single password (stored as a salted PBKDF2 hash in the configuration)
 exchanged for an opaque session token in an `HttpOnly` cookie, or — for clients other than the
 browser — an API token sent as `Authorization: Bearer agl_…`. A token carries a `Scope`: the
-sources and labels it may see, and whether it may change anything. The scope is applied inside
+sources and labels it may see, whether it may change anything, and whether it may send messages
+(replies and new ones, through the sources it sees). The scope is applied inside
 the database queries, so nothing outside it is ever read on a token's behalf. Labels, rules, views and tokens
 themselves are managed from a logged-in session only, so a leaked token cannot widen itself or
 mint more tokens. Only hashes of sessions and tokens are stored.
@@ -91,6 +92,8 @@ inductive ApiError where
   | forbidden (msg : String)
   | notFound (msg : String)
   | server (msg : String)
+  /-- A server further on (an SMTP server) refused or failed. -/
+  | badGateway (msg : String)
   | locked
 
 def ApiError.toResponse : ApiError → ApiResponse
@@ -99,6 +102,7 @@ def ApiError.toResponse : ApiError → ApiResponse
   | .forbidden m => { status := .forbidden, body := Json.mkObj [("error", m)] }
   | .notFound m => { status := .notFound, body := Json.mkObj [("error", m)] }
   | .server m => { status := .internalServerError, body := Json.mkObj [("error", m)] }
+  | .badGateway m => { status := .badGateway, body := Json.mkObj [("error", m)] }
   | .locked => { status := .serviceUnavailable
                  body := Json.mkObj [("error", "angelia was restarted: sign in to unlock it"),
                    ("locked", true)] }
@@ -474,7 +478,8 @@ def sources (ctx : AppContext) (scope : Scope) : ApiM ApiResponse := do
     | _ => pure #[]
   ok (Json.mkObj [
     ("configured", toJson ((ctx.config.sources.filter (scope.allowsSource ·.name)).map fun s =>
-      Json.mkObj [("name", s.name), ("kind", s.kind), ("enabled", s.enabled)])),
+      Json.mkObj [("name", s.name), ("kind", s.kind), ("enabled", s.enabled),
+        ("canSend", ((Connector.kind? s.kind).map (·.canSend s)).getD false)])),
     ("health", toJson health)])
 
 /-- `POST /api/tokens` body: `{"name": ..., "scope": {"sources": [...]|null,
@@ -524,6 +529,88 @@ def ingest (ctx : AppContext) (sourceName : String) (r : Req) : ApiM ApiResponse
     cctx.ingest events
   ok (Json.mkObj [("received", events.size), ("new", n)])
 
+/-! ## Sending
+
+The same for every source: a draft (`Angelia.Draft`) goes to the source's kind, which sends it its
+own way and returns the raw event of what it sent; that is stored like anything received, as an
+outgoing notification, and returned. Which sources can send is the kind's to say
+(`Connector.Kind.canSend`), and `/api/sources` reports it. A token sends only with `send` in its
+scope, only through sources in it, and answers only what it can see. -/
+
+/-- A source by name, its kind, and whether it can send. -/
+def sendingSource (ctx : AppContext) (scope : Scope) (name : String) :
+    ApiM (SourceConfig × Connector.Kind) := do
+  let some source := ctx.config.sources.find? (·.name == name)
+    | fail (.notFound s!"no source named '{name}'")
+  if !scope.allowsSource name then fail (.notFound s!"no source named '{name}'")
+  let some kind := Connector.kind? source.kind | fail (.server s!"unknown kind '{source.kind}'")
+  if !kind.canSend source then fail (.badRequest s!"source '{name}' cannot send")
+  pure (source, kind)
+
+/-- A notification to reply to, its source and kind, and its raw payload. -/
+def replyContext (ctx : AppContext) (scope : Scope) (id : Int) :
+    ApiM (Notification × SourceConfig × Connector.Kind × Json) := do
+  let n ← visible ctx scope id
+  let (source, kind) ← sendingSource ctx scope n.source
+  let some payload ← ctx.dbM (Db.rawPayload · id) | fail (.notFound "no such notification")
+  pure (n, source, kind, payload)
+
+/-- The prefilled reply, `?all=1` to everyone the original went to. -/
+def replyDraft (ctx : AppContext) (scope : Scope) (id : Int) (all : Bool) : ApiM Draft := do
+  let (_, source, kind, payload) ← replyContext ctx scope id
+  let some d := kind.replyDraft source payload all
+    | fail (.badRequest "this notification cannot be answered")
+  pure d
+
+/-- A draft from a request body, each field taken from `base` where the body leaves it out. Every
+    address must look like one, and nothing may carry a line break into a header. -/
+def draftFrom (j : Json) (base : Draft := {}) : ApiM Draft := do
+  let d : Draft := {
+    to := (← field? j "to").getD base.to, cc := (← field? j "cc").getD base.cc
+    bcc := (← field? j "bcc").getD base.bcc
+    subject := (← field? j "subject").getD base.subject
+    body := (← field? j "body").getD base.body }
+  let addrs := d.to ++ d.cc ++ d.bcc
+  if addrs.isEmpty then fail (.badRequest "a message needs a recipient ('to', 'cc' or 'bcc')")
+  for a in addrs do
+    if !a.contains '@' || a.any (fun c => c == '\r' || c == '\n') then
+      fail (.badRequest s!"not an address: {a}")
+  if d.subject.any (fun c => c == '\r' || c == '\n') then
+    fail (.badRequest "the subject cannot contain a line break")
+  pure d
+
+/-- Send through a source, store what was sent, and answer with its notification. -/
+def sendAndStore (ctx : AppContext) (source : SourceConfig) (kind : Connector.Kind) (d : Draft)
+    (original : Option Json) : ApiM ApiResponse := do
+  -- Not under the database lock: talking to a mail server takes seconds.
+  let ev ← match ← liftIO ((kind.send source ctx.config.dbPath d original).toBaseIO) with
+    | .ok ev => pure ev
+    | .error e => fail (.badGateway s!"not sent: {e}")
+  let n ← ctx.dbM fun db => do
+    let cctx : ConnectorCtx := { source, dbPath := ctx.config.dbPath, db
+                                 normalize := kind.normalize, stop := ← IO.mkRef false }
+    discard <| cctx.ingest #[ev]
+    let some id ← Db.notificationIdOf db source.name ev.externalId | return none
+    Db.getNotification db Scope.full id
+  match n with
+  | some n => ok (toJson n)
+  -- Sent, but what was sent did not normalise: not the sender's problem.
+  | none => ok (Json.mkObj [("sent", true)])
+
+/-- `POST /api/notifications/<id>/reply`: the prefilled reply (`"all": true` for everyone), with
+    whatever the body gives instead -- usually just `body`. -/
+def reply (ctx : AppContext) (scope : Scope) (id : Int) (r : Req) : ApiM ApiResponse := do
+  let j ← parseJson r.body
+  let all := ((← field? j "all") : Option Bool).getD false
+  let (_, source, kind, payload) ← replyContext ctx scope id
+  let base := (kind.replyDraft source payload all).getD {}
+  sendAndStore ctx source kind (← draftFrom j base) (some payload)
+
+/-- `POST /api/sources/<name>/messages`: a new message, `{"to", "cc", "bcc", "subject", "body"}`. -/
+def compose (ctx : AppContext) (scope : Scope) (name : String) (r : Req) : ApiM ApiResponse := do
+  let (source, kind) ← sendingSource ctx scope name
+  sendAndStore ctx source kind (← draftFrom (← parseJson r.body)) none
+
 /-- The first path segments of the routes only a logged-in session may use. -/
 def sessionOnly : List String := ["second-factors", "tokens", "labels", "rules", "views"]
 
@@ -546,6 +633,8 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
     | .token .. => fail (.forbidden "only a logged-in session may do this")
   let requireWrite : ApiM Unit :=
     if scope.write then pure () else fail (.forbidden "this token is read-only")
+  let requireSend : ApiM Unit :=
+    if scope.send then pure () else fail (.forbidden "this token may not send messages")
   match r.method, r.segments with
   | .get, ["me"] => ok principal.toJson
   | .get, ["notifications"] => listNotifications ctx scope r
@@ -554,6 +643,11 @@ def dispatch (ctx : AppContext) (r : Req) : ApiM ApiResponse := do
     getNotification ctx scope (← parseId id) (["1", "true"].contains ((r.query "raw").getD ""))
   | .get, ["notifications", id, "attachments", n] =>
     getAttachment ctx scope (← parseId id) (← parseId n)
+  | .get, ["notifications", id, "reply"] =>
+    let all := ["1", "true"].contains ((r.query "all").getD "")
+    ok (toJson (← replyDraft ctx scope (← parseId id) all))
+  | .post, ["notifications", id, "reply"] => requireSend; reply ctx scope (← parseId id) r
+  | .post, ["sources", name, "messages"] => requireSend; compose ctx scope name r
   | .put, ["notifications", id, "labels", label] =>
     requireWrite; setLabel ctx scope (← parseId id) (← parseId label) true
   | .delete, ["notifications", id, "labels", label] =>

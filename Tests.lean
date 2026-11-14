@@ -149,6 +149,101 @@ def attachmentTests (s : Suite) : IO Unit := do
   let bytes := ByteArray.mk #[0, 0x41, 0x80, 0xff, 0x0d, 0x0a]
   s.eq "latin1 round trip" (toBytes (latin1 bytes)).toList bytes.toList
 
+/-- A message to answer: a list's `Reply-To`, the account among the recipients. -/
+def toAnswer : String := crlf [
+  "From: =?UTF-8?Q?J=C3=BCrgen_M=C3=BCller?= <jm@example.org>",
+  "Reply-To: list@example.org",
+  "To: \"Doe, Jane\" <jane@example.org>, Me <me@example.org>",
+  "Cc: bob@example.org, ME@example.org",
+  "Subject: Treffen am Freitag",
+  "Date: Tue, 20 Oct 2026 14:03:07 +0200",
+  "Message-ID: <q@example.org>",
+  "References: <root@example.org>",
+  "",
+  "Passt 15 Uhr?",
+  "> earlier"]
+
+def sendingTests (s : Suite) : IO Unit := do
+  IO.println "sending"
+  s.eq "address list"
+    ((parseAddressList "\"Doe, Jane\" <jane@x.org>, bob@y.org, =?UTF-8?Q?M=C3=BCller?= <m@z.de>, undisclosed-recipients:;, c@d.org (Carl)").map
+      fun a => (a.name, a.addr))
+    #[("Doe, Jane", "jane@x.org"), ("", "bob@y.org"), ("Müller", "m@z.de"), ("Carl", "c@d.org")]
+  s.eq "a phrase with specials is quoted" (encodePhrase "Doe, Jane") "\"Doe, Jane\""
+  s.eq "a plain phrase is not" (encodePhrase "Jane Doe") "Jane Doe"
+  let long := "Grüße aus Köln, und noch ein sehr langer Betreff mit Umlauten: äöüßÄÖÜ – 🎉 Ende"
+  let words := encodedWords long
+  s.check "encoded words are at most 75 characters" (words.all (·.length ≤ 75)) s!"{words}"
+  s.eq "encoded words decode back" (decodeHeader (" ".intercalate words)) long
+  s.eq "plain subjects stay plain" (encodeText "Hello there") "Hello there"
+  let text := "Grüße,\nzweite Zeile mit Leerzeichen am Ende \n.\n" ++ String.ofList (List.replicate 120 'x') ++
+    "\n= ist ein Gleichheitszeichen"
+  let qp := quotedPrintableEncode text
+  s.check "quoted-printable lines are at most 76 characters"
+    ((qp.splitOn "\r\n").all (·.length ≤ 76)) qp
+  s.check "quoted-printable is ASCII" (qp.all fun (c : Char) => c.toNat < 128)
+  s.eq "quoted-printable decodes back"
+    (String.fromUTF8? (quotedPrintableDecode qp)) (some (text.replace "\n" "\r\n"))
+  s.check "a lone dot is escaped" ((qp.splitOn "\r\n").contains "=2E")
+  s.eq "date" (formatDate 1792497787) "Tue, 20 Oct 2026 12:03:07 +0000"
+  s.eq "epoch" (formatDate 0) "Thu, 1 Jan 1970 00:00:00 +0000"
+  s.eq "a leap day" (formatDate 1709208000) "Thu, 29 Feb 2024 12:00:00 +0000"
+  -- A reply, written and read back.
+  let (inReplyTo, references) : Option String × List String := replyThreading toAnswer
+  s.eq "reply threading" (inReplyTo, references)
+    ((some "q@example.org", ["root@example.org", "q@example.org"]) : Option String × List String)
+  let d := replyDraft toAnswer ["me@example.org"] (all := true)
+  s.eq "reply all: to Reply-To" d.to #["list@example.org"]
+  s.eq "reply all: the others copied, never the account"
+    d.cc #["\"Doe, Jane\" <jane@example.org>", "bob@example.org"]
+  s.eq "reply subject" d.subject "Re: Treffen am Freitag"
+  s.check "reply quotes the original"
+    ((d.body.splitOn "\n").contains "> Passt 15 Uhr?" && (d.body.splitOn "\n").contains ">> earlier") d.body
+  s.check "reply says who wrote it" ((d.body.splitOn "Jürgen Müller wrote:").length == 2) d.body
+  s.eq "reply to one: no copies" (replyDraft toAnswer ["me@example.org"] false).cc #[]
+  s.eq "no second Re:" (replySubject "AW: Re: x") "AW: Re: x"
+  let mine := crlf ["From: Me <me@example.org>", "To: ann@example.org", "Subject: Re: hi", "", "x"]
+  s.eq "answering one's own message goes to its recipients"
+    (replyDraft mine ["me@example.org"] false).to #["ann@example.org"]
+  let envelope : Envelope := {
+    «from» := { name := "Christian Merten", addr := "me@example.org" }
+    date := 1792497787, messageId := "new@example.org", inReplyTo, references }
+  let raw := compose envelope { d with bcc := #["hidden@example.org"], body := "Ja, gerne.\n\n" ++ d.body }
+  s.check "the message is ASCII" (raw.all fun (c : Char) => c.toNat < 128)
+  s.eq "no Bcc header" ((((raw.splitOn "\r\n\r\n").headD "").splitOn "hidden@").length) 1
+  let m := parseMessage raw
+  s.eq "written: subject" m.subject "Re: Treffen am Freitag"
+  s.eq "written: from" m.from "Christian Merten <me@example.org>"
+  s.eq "written: message id" m.messageId (some "new@example.org")
+  s.eq "written: in the original's thread" m.threadKey (some "root@example.org")
+  s.check "written: text" (m.text.startsWith "Ja, gerne.\n\n\n\nOn Tue, 20 Oct 2026") m.text
+  s.eq "envelope recipients" (d.recipients.map (·.addr)) #["list@example.org", "jane@example.org", "bob@example.org"]
+  -- SMTP.
+  s.eq "smtp reply line" (Smtp.parseLine "250-AUTH PLAIN LOGIN") (some (250, true, "AUTH PLAIN LOGIN"))
+  s.eq "smtp last line" (Smtp.parseLine "235 2.7.0 ok") (some (235, false, "2.7.0 ok"))
+  s.eq "dot stuffing" (Smtp.dotStuff "a\r\n.b\r\n..\r\nc") "a\r\n..b\r\n...\r\nc\r\n"
+  -- IMAP: the sent folder.
+  s.eq "mailbox utf-7 decoded" (decodeMailbox "Entw&APw-rfe") "Entwürfe"
+  s.eq "mailbox ampersand decoded" (decodeMailbox "A&-B") "A&B"
+  s.eq "mailbox round trip" (decodeMailbox (encodeMailbox "Gesendete Elemente – 2026 🎉"))
+    "Gesendete Elemente – 2026 🎉"
+  let listed := #[
+    Response.list? #[.text "* LIST (\\HasNoChildren) \"/\" INBOX"],
+    Response.list? #[.text "* LIST (\\HasNoChildren \\Sent) \"/\" \"Gesendete Elemente\""]].filterMap id
+  s.eq "list parsed" (listed.map (·.2)) #["INBOX", "Gesendete Elemente"]
+  s.eq "the sent folder" (sentMailbox? listed) (some "Gesendete Elemente")
+  -- What was sent, as a notification.
+  match Connector.ImapSource.normalize (Json.mkObj [("raw", raw), ("outgoing", true)]) with
+  | .ok n =>
+    s.eq "outgoing" n.outgoing true
+    s.eq "outgoing is read" n.read true
+    s.eq "recipients" n.recipients "list@example.org, Doe, Jane, bob@example.org"
+  | .error e => s.check "normalize outgoing" false e
+  s.eq "scope: send" ((fromJson? (Json.mkObj [("send", true)]) : Except String Scope).toOption.map (·.send))
+    (some true)
+  s.eq "scope: send off by default" ((fromJson? (Json.mkObj []) : Except String Scope).toOption.map (·.send))
+    (some false)
+
 def mimeTests (s : Suite) : IO Unit := do
   s.eq "html: links keep their target"
     (htmlToText "see <a href=\"https://x.org/a?b=1&amp;c=2\" target=_blank>the slides</a>, <a href='https://y.org'>https://y.org</a>")
@@ -281,7 +376,7 @@ def scopeTests (s : Suite) : IO Unit := do
   let parse (j : String) : Option Scope := (Json.parse j >>= fromJson?).toOption
   s.eq "empty scope: everything, read-only" (parse "{}") (some {})
   s.eq "explicit nulls are unrestricted" (parse "{\"sources\":null,\"labels\":null,\"write\":true}")
-    (some Scope.full)
+    (some { write := true })
   let sc : Scope := { sources := some #["mail"], labels := some #[1, 2] }
   s.eq "sql args" sc.sqlArgs (some "[\"mail\"]", some "[1,2]")
   s.eq "full scope has no sql restriction" Scope.full.sqlArgs (none, none)
@@ -441,6 +536,7 @@ def main : IO UInt32 := do
   let s : Suite := { failures := ← IO.mkRef #[] }
   mimeTests s
   attachmentTests s
+  sendingTests s
   imapTests s
   githubTests s
   ruleTests s
