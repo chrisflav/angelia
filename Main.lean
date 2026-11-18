@@ -52,7 +52,10 @@ def rederiveIfNeeded (config : Config) : IO Unit := do
   log "main" s!"re-derived {n} notification(s) with the current normalisers, {failed} failed"
 
 def startSources (config : Config) : IO Unit := do
-  try rederiveIfNeeded config catch e => log "main" s!"re-deriving failed: {e}"
+  -- In the background: with every message stored whole, re-deriving takes minutes, and the
+  -- server should answer and the sources sync meanwhile (it commits a page at a time).
+  discard <| IO.asTask (prio := .dedicated) do
+    try rederiveIfNeeded config catch e => log "main" s!"re-deriving failed: {e}"
   let stop ← IO.mkRef false
   for source in config.sources do
     if !source.enabled then continue

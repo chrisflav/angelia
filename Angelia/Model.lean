@@ -48,6 +48,11 @@ structure NotificationData where
   read : Bool := false
   /-- Only mail has them, and only what the mail's raw event can be asked for again. -/
   attachments : Array Attachment := #[]
+  /-- Sent rather than received: by angelia, or found in a mailbox's sent folder. Kept out of the
+      inbox, and shown with its conversation. -/
+  outgoing : Bool := false
+  /-- Who it went to, as people read it (`Ann Example, bob@example.org`), where the source says. -/
+  recipients : String := ""
 deriving Inhabited, Repr, ToJson
 
 /-- Every field is optional except `title`, so a pushing program sends only what it has. -/
@@ -62,7 +67,29 @@ instance : FromJson NotificationData where
       kind := ← opt "kind" d.kind, threadKey := ← opt "threadKey" none
       author := ← opt "author" d.author, title := ← j.getObjValAs? String "title"
       body := ← opt "body" d.body, url := ← opt "url" none, sentAt := ← opt "sentAt" none
-      read := ← opt "read" d.read }
+      read := ← opt "read" d.read, outgoing := ← opt "outgoing" d.outgoing
+      recipients := ← opt "recipients" d.recipients }
+
+/-- A message to send, the same for every source that can send one: addresses as people write
+    them (`Ann Example <ann@example.org>`, or the bare address), a subject and a plain-text body.
+    A source that has no use for a field (a chat has no subject) ignores it. -/
+structure Draft where
+  to : Array String := #[]
+  cc : Array String := #[]
+  bcc : Array String := #[]
+  subject : String := ""
+  body : String := ""
+deriving Inhabited, Repr, BEq, ToJson
+
+/-- Every field is optional, so a reply sends only what it changes of the prefilled draft. -/
+instance : FromJson Draft where
+  fromJson? j := do
+    let opt {α} [FromJson α] (k : String) (d : α) : Except String α :=
+      match j.getObjVal? k with
+      | .ok .null | .error _ => pure d
+      | .ok v => fromJson? v
+    return { to := ← opt "to" #[], cc := ← opt "cc" #[], bcc := ← opt "bcc" #[]
+             subject := ← opt "subject" "", body := ← opt "body" "" }
 
 /-- A stored notification. -/
 structure Notification where
@@ -87,7 +114,8 @@ instance : ToJson Notification where
     ("title", n.data.title), ("body", n.data.body), ("url", toJson n.data.url),
     ("sentAt", toJson n.data.sentAt), ("receivedAt", n.receivedAt), ("read", n.read),
     ("archived", n.archived), ("starred", n.starred), ("labels", toJson n.labels),
-    ("attachments", toJson n.data.attachments), ("time", n.time)]
+    ("attachments", toJson n.data.attachments), ("outgoing", n.data.outgoing),
+    ("recipients", n.data.recipients), ("time", n.time)]
 
 /-- A user-defined label. Labels are how notifications are organised, independently of where they
     came from. -/
@@ -120,6 +148,9 @@ structure Scope where
   labels : Option (Array Int) := none
   /-- Whether the token may change notifications (read/archived/starred, labels in scope). -/
   write : Bool := false
+  /-- Whether the token may send messages, through the sources in scope: replies to what it can
+      see, and new messages. Apart from `write`, since a message sent cannot be taken back. -/
+  send : Bool := false
   /-- Only notifications from this time on (Unix seconds). -/
   since : Option Int := none
   /-- Only notifications from the past this many seconds. -/
@@ -135,10 +166,11 @@ instance : FromJson Scope where
     let within : Option Nat ← opt "within"
     if within == some 0 then throw "'within' must be positive"
     return { sources := ← opt "sources", labels := ← opt "labels"
-             write := (← opt "write").getD false, since := ← opt "since", within }
+             write := (← opt "write").getD false, send := (← opt "send").getD false
+             since := ← opt "since", within }
 
 /-- The scope of a logged-in session. -/
-def Scope.full : Scope := { write := true }
+def Scope.full : Scope := { write := true, send := true }
 
 /-- The scope parameters as SQL arguments: JSON arrays for `json_each`, or `NULL`. -/
 def Scope.sqlArgs (s : Scope) : Option String × Option String :=

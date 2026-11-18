@@ -41,13 +41,15 @@ def schemaSql : String := "
     external_id TEXT NOT NULL,
     kind TEXT NOT NULL,
     thread_key TEXT,
-    -- Sealed JSON of the external id, author, title, body, url and thread key.
+    -- Sealed JSON of the external id and the derived fields: author, title, body, url, ...
     content BLOB NOT NULL,
     sent_at INTEGER,
     received_at INTEGER NOT NULL,
     read INTEGER NOT NULL DEFAULT 0,
     archived INTEGER NOT NULL DEFAULT 0,
     starred INTEGER NOT NULL DEFAULT 0,
+    -- Sent rather than received; derived, like `kind`.
+    outgoing INTEGER NOT NULL DEFAULT 0,
     UNIQUE (source, external_id)
   );
   CREATE INDEX IF NOT EXISTS notification_order ON notification (archived, received_at DESC);
@@ -163,8 +165,9 @@ def schemaSql : String := "
   );
 "
 
-/-- Bumped when the schema changes incompatibly. Version 2 is the first with encrypted content. -/
-def schemaVersion : Int64 := 2
+/-- Bumped when the schema changes. Version 2 is the first with encrypted content, which earlier
+    ones cannot be migrated to; version 3 adds `notification.outgoing`. -/
+def schemaVersion : Int64 := 3
 
 def connect (path : System.FilePath) : IO Conn := do
   let db ← SQLite.openWith path .readWriteCreate (busyTimeoutMs := 10000)
@@ -178,7 +181,9 @@ def migrate (db : Conn) : IO Unit := do
   let version ← (← db query!"PRAGMA user_version" as Int64).toArray
   let tables ← (← db query!"SELECT count(*) FROM sqlite_master WHERE name = 'notification'"
     as Int64).toArray
-  if tables[0]! != 0 && version[0]! != schemaVersion then
+  if tables[0]! != 0 && version[0]! == 2 then
+    db.exec "ALTER TABLE notification ADD COLUMN outgoing INTEGER NOT NULL DEFAULT 0"
+  else if tables[0]! != 0 && version[0]! != schemaVersion then
     throw (IO.userError "the database was created by an earlier, unencrypted version of angelia; \
       move it away and let the sources fetch again")
   db.exec schemaSql
@@ -210,6 +215,14 @@ def insertRaw (db : Conn) (source : String) (ev : RawEvent) (now : Int) : IO (Op
     ON CONFLICT (source, external_id) DO NOTHING RETURNING id" as Int64).toArray
   pure (rows[0]?.map (·.toInt))
 
+/-- The notification derived from the raw event `(source, externalId)`, if there is one: what a
+    message just sent became, also when syncing stored it first. -/
+def notificationIdOf (db : Conn) (source externalId : String) : IO (Option Int) := do
+  let kid := Vault.keyedId (← Vault.keys) source externalId
+  let rows ← (← db query!"SELECT id FROM notification WHERE source = {source}
+    AND external_id = {kid}" as Int64).toArray
+  return rows[0]?.map (·.toInt)
+
 /-- Whether a raw event is already stored. Lets a connector skip enriching events it has. -/
 def rawExists (db : Conn) (source externalId : String) : IO Bool := do
   let kid := Vault.keyedId (← Vault.keys) source externalId
@@ -228,14 +241,16 @@ def upsertNotification (db : Conn) (rawId : Int) (source externalId : String)
   let threadKey := n.threadKey.map (Vault.keyedId k source)
   let content ← Vault.seal k (contentAad source kid) (Json.mkObj [("externalId", externalId),
     ("author", n.author), ("title", n.title), ("body", n.body), ("url", toJson n.url),
-    ("threadKey", toJson n.threadKey), ("attachments", toJson n.attachments)]).compress
+    ("threadKey", toJson n.threadKey), ("attachments", toJson n.attachments),
+    ("outgoing", n.outgoing), ("recipients", n.recipients)]).compress
   let sentAt := n.sentAt.map i64
   let rows ← (← db query!"INSERT INTO notification
-      (raw_id, source, external_id, kind, thread_key, content, sent_at, received_at, read, archived)
+      (raw_id, source, external_id, kind, thread_key, content, sent_at, received_at, read, archived,
+       outgoing)
     VALUES ({i64 rawId}, {source}, {kid}, {n.kind}, {threadKey}, {content}, {sentAt},
-       {i64 receivedAt}, {read}, {archived})
+       {i64 receivedAt}, {read}, {archived}, {n.outgoing})
     ON CONFLICT (raw_id) DO UPDATE SET kind = excluded.kind, thread_key = excluded.thread_key,
-       content = excluded.content, sent_at = excluded.sent_at
+       content = excluded.content, sent_at = excluded.sent_at, outgoing = excluded.outgoing
     RETURNING id" as Int64).toArray
   pure rows[0]!.toInt
 
@@ -290,7 +305,9 @@ private def NotificationRow.decrypt (k : Vault.Keys) (r : NotificationRow) :
     { kind := r.kind, threadKey := str "threadKey", author := (str "author").getD ""
       title := (str "title").getD "", body := (str "body").getD "", url := str "url"
       sentAt := r.sentAt.map (·.toInt), read := r.read
-      attachments := (j.getObjValAs? (Array Attachment) "attachments").toOption.getD #[] })
+      attachments := (j.getObjValAs? (Array Attachment) "attachments").toOption.getD #[]
+      outgoing := (j.getObjValAs? Bool "outgoing").toOption.getD false
+      recipients := (str "recipients").getD "" })
 
 /-- As the API shows it. The thread key is the keyed hash, which groups just as well. -/
 private def NotificationRow.toNotification (k : Vault.Keys) (r : NotificationRow) :
@@ -308,7 +325,7 @@ structure Filter where
   q : Option String := none
   source : Option String := none
   label : Option Int := none
-  /-- `inbox` (not archived), `unread`, `archived`, `starred`, or `all`. -/
+  /-- `inbox` (not archived, not sent), `unread`, `sent`, `archived`, `starred`, or `all`. -/
   state : String := "inbox"
   thread : Option String := none
   /-- `newest` (by the time it was sent), `oldest`, or `arrived` (newest by when it arrived). -/
@@ -347,8 +364,9 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
       AND ({minT} IS NULL OR (CASE WHEN n.sent_at IS NULL OR n.sent_at > n.received_at
         THEN n.received_at ELSE n.sent_at END) >= {minT})
       AND CASE {f.state}
-        WHEN 'inbox' THEN n.archived = 0
-        WHEN 'unread' THEN n.archived = 0 AND n.read = 0
+        WHEN 'inbox' THEN n.archived = 0 AND n.outgoing = 0
+        WHEN 'unread' THEN n.archived = 0 AND n.read = 0 AND n.outgoing = 0
+        WHEN 'sent' THEN n.outgoing = 1
         WHEN 'archived' THEN n.archived = 1
         WHEN 'starred' THEN n.starred = 1
         ELSE 1 END)

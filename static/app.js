@@ -208,9 +208,12 @@ function renderSidebar() {
   const plain = state.view === "list" && !f.source && !f.label && !f.thread;
   const health = Object.fromEntries(state.sources.health.map((s) => [s.source, s]));
   const items = [
+    sendingSources().length > 0 && h("button", { class: "primary compose", onclick: () => composeDialog() },
+      "New message", h("kbd", {}, "c")),
     navItem("Inbox", plain && f.state === "inbox", () => setFilter({}), state.counts.unread),
     navItem("Unread", plain && f.state === "unread", () => setFilter({ state: "unread" })),
     navItem("Starred", plain && f.state === "starred", () => setFilter({ state: "starred" })),
+    navItem("Sent", plain && f.state === "sent", () => setFilter({ state: "sent" })),
     navItem("Archived", plain && f.state === "archived", () => setFilter({ state: "archived" })),
     navItem("Everything", plain && f.state === "all", () => setFilter({ state: "all" })),
   ];
@@ -336,7 +339,8 @@ function renderList() {
       "data-i": e.i,
       onclick: () => select(e.i),
     },
-    h("span", { class: "who" }, h("span", { class: "source-tag" }, n.source), n.author),
+    h("span", { class: "who" }, h("span", { class: "source-tag" }, n.source),
+      n.outgoing ? "To: " + (n.recipients || "\u2026") : n.author),
     h("span", { class: "when" }, (n.starred ? "★ " : "") + when(n.time)),
     h("span", { class: "title" }, n.title, labelChips(n)),
     h("span", { class: "snippet" }, snippet(n.body)));
@@ -381,9 +385,13 @@ function renderDetail() {
       h("h1", {}, n.title),
       h("dl", {},
         h("dt", {}, "From"), h("dd", {}, h("strong", {}, n.author || n.source)),
+        n.recipients && [h("dt", {}, "To"), h("dd", {}, n.recipients)],
         h("dt", {}, "Source"), h("dd", {}, n.source, n.kind && n.kind !== "mail" ? ` (${n.kind})` : null),
         h("dt", {}, "Date"), h("dd", {}, h("time", { datetime: new Date(n.time * 1000).toISOString() }, longTime(n.time)))),
       h("div", { class: "actions" },
+        canSend(n.source) && h("button", { onclick: () => composeDialog({ reply: n }) }, "Reply", key("r")),
+        canSend(n.source) && h("button", { onclick: () => composeDialog({ reply: n, all: true }) },
+          "Reply all", key("a")),
         h("button", { onclick: () => update([n.id], { archived: !n.archived }) },
           n.archived ? "Move to inbox" : "Archive", key("e")),
         h("button", { onclick: () => update([n.id], { starred: !n.starred }) },
@@ -420,6 +428,75 @@ function attachmentList(n) {
       h("a", { href: `/api/notifications/${n.id}/attachments/${i}`, download: a.name, title: a.mime }, a.name),
       h("span", { class: "size", title: a.partial ? "The message was larger than what is fetched of it" : null },
         byteSize(a.size) + (a.partial ? ", incomplete" : "")))));
+}
+
+/* ---------- sending ---------- */
+
+/** The sources a message can be sent through. Which ones can is the server's to say. */
+const sendingSources = () => state.sources.configured.filter((s) => s.canSend);
+const canSend = (source) => sendingSources().some((s) => s.name === source);
+
+/** Write a message: a new one, or with `reply` the answer to that notification (`all`: to
+    everyone it went to), prefilled by the server the way the source answers. The same for every
+    source; a field is a comma-separated list where it takes addresses. */
+async function composeDialog({ reply, all } = {}) {
+  let draft = { to: [], cc: [], bcc: [], subject: "", body: "" };
+  if (reply) {
+    try { draft = await api("GET", `notifications/${reply.id}/reply` + (all ? "?all=1" : "")); }
+    catch (err) { alert(err.message); return; }
+  }
+  const from = h("select", {}, (reply ? [{ name: reply.source }] : sendingSources())
+    .map((s) => h("option", { value: s.name }, s.name)));
+  if (reply) from.disabled = true;
+  const list = (xs) => xs.join(", ");
+  const to = h("input", { value: list(draft.to), placeholder: "name@example.org, …" });
+  const cc = h("input", { value: list(draft.cc) });
+  const bcc = h("input", { value: list(draft.bcc) });
+  const subject = h("input", { value: draft.subject });
+  const body = h("textarea", { rows: 14 });
+  body.value = draft.body;
+  const error = h("p", { class: "error", role: "alert" });
+  const sendButton = h("button", { class: "primary" }, "Send");
+  const dlg = openDialog(reply ? (all ? "Reply all" : "Reply") : "New message", (close) => {
+    const fields = (input) => input.value.trim() ? [input.value.trim()] : [];
+    sendButton.addEventListener("click", async () => {
+      error.textContent = "";
+      const message = { to: fields(to), cc: fields(cc), bcc: fields(bcc), subject: subject.value,
+        body: body.value };
+      if (!message.to.length && !message.cc.length && !message.bcc.length) {
+        error.textContent = "Who is it to?";
+        return;
+      }
+      sendButton.disabled = true;
+      sendButton.textContent = "Sending…";
+      try {
+        if (reply) await api("POST", `notifications/${reply.id}/reply`, message);
+        else await api("POST", `sources/${encodeURIComponent(from.value)}/messages`, message);
+        close();
+        refresh();
+      } catch (err) {
+        error.textContent = err.message;
+        sendButton.disabled = false;
+        sendButton.textContent = "Send";
+      }
+    });
+    // Ctrl+Enter sends, as in mail programs.
+    body.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) sendButton.click();
+    });
+    return [
+      row("From", from), row("To", to), row("Cc", cc), row("Bcc", bcc), row("Subject", subject),
+      body, error,
+      h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"), sendButton),
+    ];
+  }, "compose-dialog");
+  // Escape closes a dialog; not one with a message written in it, unasked.
+  dlg.addEventListener("cancel", (e) => {
+    if (body.value !== draft.body && !confirm("Discard this message?")) e.preventDefault();
+  });
+  // A reply is written above the quote.
+  if (reply) { body.focus(); body.setSelectionRange(0, 0); }
+  return dlg;
 }
 
 /* ---------- message bodies ---------- */
@@ -648,8 +725,8 @@ function row(label, control, hint) {
 }
 
 /** A modal step, closed with Escape or Cancel. Resolves when it closes. */
-function openDialog(title, build) {
-  const dlg = h("dialog", { class: "dialog" });
+function openDialog(title, build, cls) {
+  const dlg = h("dialog", { class: "dialog" + (cls ? " " + cls : "") });
   const close = () => dlg.close();
   fill(dlg, h("h2", {}, title), build(close));
   document.body.append(dlg);
@@ -845,7 +922,8 @@ function describeScope(scope) {
   const time = [scope.since && `from ${when(scope.since)} on`, scope.within && `from the past ${span(scope.within)}`]
     .filter(Boolean).join(" and ");
   return [`Sees ${sources}${labels ? ", " + labels : ""}${time ? ", " + time : ""}.`,
-    scope.write ? "May mark read, archive, star and label." : "Read-only."];
+    scope.write ? "May mark read, archive, star and label." : "Read-only.",
+    scope.send ? "May send messages." : null].filter(Boolean);
 }
 
 /** Any time, since a date, or a moving window of hours or days. */
@@ -884,12 +962,14 @@ async function tokensPage(created) {
     const name = h("input", { placeholder: "e.g. phone" });
     const sources = {}, labels = {}, time = {};
     const write = h("input", { type: "checkbox" });
+    const send = h("input", { type: "checkbox" });
     const error = h("p", { class: "error", role: "alert" });
     const create = async () => {
       if (!name.value.trim()) { error.textContent = "Give the token a name."; return; }
       try {
         const t = await api("POST", "tokens", { name: name.value.trim(),
-          scope: { sources: sources.get(), labels: labels.get(), write: write.checked, ...time.get() } });
+          scope: { sources: sources.get(), labels: labels.get(), write: write.checked, send: send.checked,
+            ...time.get() } });
         close();
         showSettings("tokens", t);
       } catch (err) { error.textContent = err.message; }
@@ -900,6 +980,8 @@ async function tokensPage(created) {
       row("Labels", subsetPicker("t-labels", state.labels.map((l) => [l.id, l.name]), labels)),
       row("Time", timePicker(time), "By when a notification was sent. A window moves: older ones drop out."),
       row("Changes", h("label", { class: "check" }, write, "May mark read, archive, star and label")),
+      row("Sending", h("label", { class: "check" }, send, "May send messages through its sources"),
+        "Replies to what it sees, and new messages. What is sent cannot be taken back."),
       error,
       h("div", { class: "buttons end" }, h("button", { onclick: close }, "Cancel"),
         h("button", { class: "primary", onclick: create }, "Create token")),
@@ -1088,6 +1170,9 @@ document.addEventListener("keydown", (e) => {
     case "u": if (n) update([n.id], { read: !n.read }); break;
     case "t": if (n?.threadKey) setFilter({ state: "all", thread: n.threadKey, source: n.source }); break;
     case "o": if (n?.url) window.open(n.url, "_blank", "noopener,noreferrer"); break;
+    case "r": if (n && canSend(n.source)) { e.preventDefault(); composeDialog({ reply: n }); } break;
+    case "a": if (n && canSend(n.source)) { e.preventDefault(); composeDialog({ reply: n, all: true }); } break;
+    case "c": if (sendingSources().length) { e.preventDefault(); composeDialog(); } break;
     case "Escape": setFilter({}); break;
     default: return;
   }

@@ -163,7 +163,7 @@ structure Mailbox where
   exists_ : Nat
 deriving Repr
 
-/-- Open a mailbox read-only. Nothing the client does ever changes the mailbox. -/
+/-- Open a mailbox read-only: syncing never changes a mailbox (only `append` does, for sending). -/
 def examine (c : Conn) (mailbox : String) : IO Mailbox := do
   let name ← match quote (encodeMailbox mailbox) with
     | .ok n => pure n
@@ -187,6 +187,21 @@ def fetchSizes (c : Conn) (set : String) (byUid : Bool) : IO (Array Fetched) := 
   let pre := if byUid then "UID " else ""
   let rs ← c.command s!"{pre}FETCH {set} (UID RFC822.SIZE)"
   return rs.filterMap Response.fetch?
+
+/-- Every mailbox, with its attributes. -/
+def list (c : Conn) : IO (Array (List String × String)) := do
+  let rs ← c.command "LIST \"\" \"*\""
+  return rs.filterMap Response.list?
+
+/-- Store a message (a byte string) in a mailbox, flagged `\Seen`: how a message sent by SMTP gets
+    into the sent folder, where the server does not put it there itself. The one change this
+    client ever makes to a mailbox. -/
+def append (c : Conn) (mailbox : String) (message : String) : IO Unit := do
+  let name ← match quote (encodeMailbox mailbox) with
+    | .ok n => pure n
+    | .error e => throw (IO.userError e)
+  discard <| c.command s!"APPEND {name} (\\Seen) \{{(toBytes message).size}}"
+    (onContinuation := some message)
 
 /-- End the current `IDLE`. Only the first call per `IDLE` writes anything. -/
 def sendDone (c : Conn) : IO Unit := do

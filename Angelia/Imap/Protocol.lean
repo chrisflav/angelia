@@ -245,4 +245,66 @@ def encodeMailbox (name : String) : String := Id.run do
       pending := pending.push c
   return out ++ flush pending
 
+/-- The inverse of `encodeMailbox`: a mailbox name as the server lists it, in Unicode. A
+    malformed `&...-` run is kept as it is. -/
+def decodeMailbox (name : String) : String := Id.run do
+  let mut out := ""
+  let mut rest := name.toList
+  while !rest.isEmpty do
+    match rest with
+    | '&' :: '-' :: r => out := out.push '&'; rest := r
+    | '&' :: r =>
+      let (enc, after) := r.span (· != '-')
+      let bytes := base64Decode (String.ofList (enc.map fun c => if c == ',' then '/' else c))
+      -- UTF-16BE, with surrogate pairs.
+      let units := (List.range (bytes.size / 2)).map fun i =>
+        bytes[2 * i]!.toNat * 256 + bytes[2 * i + 1]!.toNat
+      let rec chars : List Nat → List Char
+        | hi :: lo :: us =>
+          if 0xD800 ≤ hi && hi < 0xDC00 && 0xDC00 ≤ lo && lo < 0xE000 then
+            Char.ofNat (0x10000 + ((hi - 0xD800) <<< 10) + (lo - 0xDC00)) :: chars us
+          else Char.ofNat hi :: chars (lo :: us)
+        | [u] => [Char.ofNat u]
+        | [] => []
+      if after.isEmpty || enc.isEmpty then
+        out := out ++ String.ofList ('&' :: r)
+        rest := []
+      else
+        out := out ++ String.ofList (chars units)
+        rest := after.drop 1
+    | c :: r => out := out.push c; rest := r
+    | [] => pure ()
+  return out
+where
+  /-- Base64 without padding, as modified UTF-7 writes it. -/
+  base64Decode (s : String) : ByteArray := Id.run do
+    let value (c : Char) : Nat :=
+      if 'A' ≤ c && c ≤ 'Z' then c.toNat - 'A'.toNat
+      else if 'a' ≤ c && c ≤ 'z' then c.toNat - 'a'.toNat + 26
+      else if '0' ≤ c && c ≤ '9' then c.toNat - '0'.toNat + 52
+      else if c == '+' then 62 else 63
+    let mut out := ByteArray.empty
+    let mut acc := 0
+    let mut bits := 0
+    for c in s.toList do
+      acc := ((acc <<< 6) ||| value c) &&& 0xFFFFFF
+      bits := bits + 6
+      if bits ≥ 8 then
+        bits := bits - 8
+        out := out.push ((acc >>> bits) &&& 0xFF).toUInt8
+    return out
+
+/-- `* LIST (\HasNoChildren \Sent) "/" "Sent"`: the mailbox's attributes and its name, decoded. -/
+def Response.list? (r : Response) : Option (List String × String) := do
+  let vs ← r.untagged?
+  guard ((vs[0]? >>= Value.text?).map String.toUpper == some "LIST")
+  let attrs := ((← vs[1]?).list?.getD #[]).toList.filterMap Value.text?
+  let name ← vs[3]? >>= Value.text?
+  return (attrs, decodeMailbox name)
+
+/-- The mailbox flagged `\Sent` (RFC 6154), from `LIST` responses. -/
+def sentMailbox? (listed : Array (List String × String)) : Option String :=
+  listed.findSome? fun (attrs, name) =>
+    if attrs.any (·.toLower == "\\sent") then some name else none
+
 end Angelia.Imap
