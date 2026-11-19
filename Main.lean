@@ -54,8 +54,17 @@ def rederiveIfNeeded (config : Config) : IO Unit := do
 def startSources (config : Config) : IO Unit := do
   -- In the background: with every message stored whole, re-deriving takes minutes, and the
   -- server should answer and the sources sync meanwhile (it commits a page at a time).
+  -- A failure (a page that could not be written) is tried again a minute later: re-deriving is
+  -- idempotent, and until it is done the stored notifications lack what the normalisers add.
   discard <| IO.asTask (prio := .dedicated) do
-    try rederiveIfNeeded config catch e => log "main" s!"re-deriving failed: {e}"
+    let mut done := false
+    while !done do
+      try
+        rederiveIfNeeded config
+        done := true
+      catch e =>
+        log "main" s!"re-deriving failed, trying again in a minute: {e}"
+        IO.sleep 60000
   let stop ← IO.mkRef false
   for source in config.sources do
     if !source.enabled then continue
@@ -66,8 +75,9 @@ def startSources (config : Config) : IO Unit := do
     let ctx : ConnectorCtx := { source, dbPath := config.dbPath, db := cdb
                                 normalize := kind.normalize, stop }
     ctx.health "starting"
-    discard <| IO.asTask (prio := .dedicated) do
-      try run ctx catch e => ctx.log s!"stopped: {e}"
+    -- Supervised, so a start that fails -- the database busy, a token refresh refused -- is tried
+    -- again with backoff rather than ending the source until angelia restarts.
+    discard <| IO.asTask (prio := .dedicated) (ctx.supervise (run ctx))
     log "main" s!"source '{source.name}' ({source.kind}) started"
 
 def serve (config : Config) : IO Unit := do

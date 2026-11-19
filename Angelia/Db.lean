@@ -1,4 +1,5 @@
 import SQLite
+import Std.Sync.Mutex
 import Angelia.Model
 import Angelia.Rules
 import Angelia.Util
@@ -170,7 +171,9 @@ def schemaSql : String := "
 def schemaVersion : Int64 := 3
 
 def connect (path : System.FilePath) : IO Conn := do
-  let db ← SQLite.openWith path .readWriteCreate (busyTimeoutMs := 10000)
+  -- Long enough to outlast any one transaction (see `withTransaction`), which a single write
+  -- outside one, such as a cursor or a health row, may have to wait for.
+  let db ← SQLite.openWith path .readWriteCreate (busyTimeoutMs := 120000)
   db.exec "PRAGMA foreign_keys = ON"
   db.exec "PRAGMA journal_mode = WAL"
   -- Overwrite deleted content instead of leaving it in free pages.
@@ -189,31 +192,55 @@ def migrate (db : Conn) : IO Unit := do
   db.exec schemaSql
   db.exec s!"PRAGMA user_version = {schemaVersion}"
 
-def withTransaction (db : Conn) (act : IO α) : IO α := do
-  db.exec "BEGIN IMMEDIATE"
-  try
-    let r ← act
-    db.exec "COMMIT"
-    pure r
-  catch e =>
-    try db.exec "ROLLBACK" catch _ => pure ()
-    throw e
+/-- Held for the length of every write transaction in this process. Every writer is in this process,
+    one connection per thread, and a transaction can take seconds -- a batch of whole messages
+    encrypted, a page of a replay -- so several waiting on SQLite's busy timeout at once, as on
+    the first start with many folders to sync, would see `database is locked`. Waiting here
+    instead, they take turns. -/
+initialize writeLock : Std.Mutex Unit ← Std.Mutex.new ()
+
+/-- Run `act` as one write transaction. Not to be nested: the lock is not reentrant. -/
+def withTransaction (db : Conn) (act : IO α) : IO α :=
+  writeLock.atomically do
+    db.exec "BEGIN IMMEDIATE"
+    try
+      let r ← act
+      db.exec "COMMIT"
+      pure r
+    catch e =>
+      try db.exec "ROLLBACK" catch _ => pure ()
+      throw e
 
 private def i64 (n : Int) : Int64 := Int64.ofInt n
 
 /-! ## Raw events and notifications -/
 
-/-- Store a raw event unless one with the same `(source, externalId)` exists. Returns its id when
-    it was new. -/
-def insertRaw (db : Conn) (source : String) (ev : RawEvent) (now : Int) : IO (Option Int) := do
+/-- A raw event ready to store: its keyed id and sealed payload. Sealing a whole message takes
+    seconds, so it is done before the write transaction (`insertPrepared`), not in it. -/
+structure PreparedRaw where
+  kid : String
+  payload : ByteArray
+
+def prepareRaw (source : String) (ev : RawEvent) : IO PreparedRaw := do
   let k ← Vault.keys
   let kid := Vault.keyedId k source ev.externalId
   let payload ← Vault.seal k s!"raw\x00{source}\x00{kid}"
     (Json.mkObj [("externalId", ev.externalId), ("payload", ev.payload)]).compress
+  return { kid, payload }
+
+/-- Store a prepared raw event unless one with the same `(source, externalId)` exists. Returns its
+    id when it was new. -/
+def insertPrepared (db : Conn) (source : String) (p : PreparedRaw) (now : Int) :
+    IO (Option Int) := do
   let rows ← (← db query!"INSERT INTO raw_event (source, external_id, received_at, payload)
-    VALUES ({source}, {kid}, {i64 now}, {payload})
+    VALUES ({source}, {p.kid}, {i64 now}, {p.payload})
     ON CONFLICT (source, external_id) DO NOTHING RETURNING id" as Int64).toArray
   pure (rows[0]?.map (·.toInt))
+
+/-- Store a raw event unless one with the same `(source, externalId)` exists. Returns its id when
+    it was new. -/
+def insertRaw (db : Conn) (source : String) (ev : RawEvent) (now : Int) : IO (Option Int) := do
+  insertPrepared db source (← prepareRaw source ev) now
 
 /-- The notification derived from the raw event `(source, externalId)`, if there is one: what a
     message just sent became, also when syncing stored it first. -/
@@ -232,27 +259,45 @@ def rawExists (db : Conn) (source externalId : String) : IO Bool := do
 
 private def contentAad (source kid : String) : String := s!"notification\x00{source}\x00{kid}"
 
-/-- Insert the notification derived from raw event `rawId`, or refresh its derived columns if it
-    exists (a replay), leaving the user's read/archived/starred state alone. -/
-def upsertNotification (db : Conn) (rawId : Int) (source externalId : String)
-    (n : NotificationData) (receivedAt : Int) (read archived : Bool) : IO Int := do
+/-- A notification ready to store: its derived columns, the content sealed (see `PreparedRaw`). -/
+structure PreparedNotification where
+  kid : String
+  kind : String
+  threadKey : Option String
+  content : ByteArray
+  sentAt : Option Int64
+  outgoing : Bool
+
+def prepareNotification (source externalId : String) (n : NotificationData) :
+    IO PreparedNotification := do
   let k ← Vault.keys
   let kid := Vault.keyedId k source externalId
-  let threadKey := n.threadKey.map (Vault.keyedId k source)
   let content ← Vault.seal k (contentAad source kid) (Json.mkObj [("externalId", externalId),
     ("author", n.author), ("title", n.title), ("body", n.body), ("url", toJson n.url),
     ("threadKey", toJson n.threadKey), ("attachments", toJson n.attachments),
     ("outgoing", n.outgoing), ("recipients", n.recipients)]).compress
-  let sentAt := n.sentAt.map i64
+  return { kid, kind := n.kind, threadKey := n.threadKey.map (Vault.keyedId k source), content
+           sentAt := n.sentAt.map i64, outgoing := n.outgoing }
+
+/-- Insert a prepared notification derived from raw event `rawId`, or refresh its derived
+    columns if it exists (a replay), leaving the user's read/archived/starred state alone. -/
+def upsertPrepared (db : Conn) (rawId : Int) (source : String) (p : PreparedNotification)
+    (receivedAt : Int) (read archived : Bool) : IO Int := do
   let rows ← (← db query!"INSERT INTO notification
       (raw_id, source, external_id, kind, thread_key, content, sent_at, received_at, read, archived,
        outgoing)
-    VALUES ({i64 rawId}, {source}, {kid}, {n.kind}, {threadKey}, {content}, {sentAt},
-       {i64 receivedAt}, {read}, {archived}, {n.outgoing})
+    VALUES ({i64 rawId}, {source}, {p.kid}, {p.kind}, {p.threadKey}, {p.content}, {p.sentAt},
+       {i64 receivedAt}, {read}, {archived}, {p.outgoing})
     ON CONFLICT (raw_id) DO UPDATE SET kind = excluded.kind, thread_key = excluded.thread_key,
        content = excluded.content, sent_at = excluded.sent_at, outgoing = excluded.outgoing
     RETURNING id" as Int64).toArray
   pure rows[0]!.toInt
+
+/-- Insert the notification derived from raw event `rawId`, or refresh its derived columns if it
+    exists (a replay), leaving the user's read/archived/starred state alone. -/
+def upsertNotification (db : Conn) (rawId : Int) (source externalId : String)
+    (n : NotificationData) (receivedAt : Int) (read archived : Bool) : IO Int := do
+  upsertPrepared db rawId source (← prepareNotification source externalId n) receivedAt read archived
 
 private def openRaw (k : Vault.Keys) (source kid : String) (payload : ByteArray) :
     IO (String × Json) := do

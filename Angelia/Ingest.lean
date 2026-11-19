@@ -60,23 +60,36 @@ def fork (c : ConnectorCtx) : IO ConnectorCtx := return { c with db := ← Db.co
 def log (c : ConnectorCtx) (msg : String) : IO Unit := Angelia.log c.name msg
 
 /-- Ingest a batch in one transaction. Returns how many events were new. A payload that fails to
-    normalise is still stored raw (and logged), so fixing the normaliser and replaying recovers it. -/
+    normalise is still stored raw (and logged), so fixing the normaliser and replaying recovers it.
+
+    Everything slow -- normalising, sealing what is stored -- happens before the transaction,
+    which only writes: it holds the database's one write lock, and every source and the API wait
+    on it. What is already stored is not prepared at all. -/
 def ingest (c : ConnectorCtx) (events : Array RawEvent) : IO Nat := do
   if events.isEmpty then return 0
   let now ← nowSeconds
-  let (fresh, ids) ← Db.withTransaction c.db do
-    let rules ← Db.listRules c.db
-    let mut fresh := 0
-    let mut ids := #[]
-    for ev in events do
-      let some rawId ← Db.insertRaw c.db c.name ev now | continue
-      fresh := fresh + 1
-      match c.normalize ev.payload with
-      | .error e => c.log s!"cannot normalise {ev.externalId}: {e}"
+  let rules ← Db.listRules c.db
+  let mut prepared := #[]
+  for ev in events do
+    if ← Db.rawExists c.db c.name ev.externalId then continue
+    let raw ← Db.prepareRaw c.name ev
+    let derived ← match c.normalize ev.payload with
+      | .error e => pure (Except.error e)
       | .ok n =>
         let o := evaluate rules c.name n
-        let id ← Db.upsertNotification c.db rawId c.name ev.externalId n now
-          (n.read || o.markRead) o.archive
+        pure (.ok (n, o, ← Db.prepareNotification c.name ev.externalId n))
+    prepared := prepared.push (ev, raw, derived)
+  if prepared.isEmpty then return 0
+  let (fresh, ids) ← Db.withTransaction c.db do
+    let mut fresh := 0
+    let mut ids := #[]
+    for (ev, raw, derived) in prepared do
+      let some rawId ← Db.insertPrepared c.db c.name raw now | continue
+      fresh := fresh + 1
+      match derived with
+      | .error e => c.log s!"cannot normalise {ev.externalId}: {e}"
+      | .ok (n, o, pn) =>
+        let id ← Db.upsertPrepared c.db rawId c.name pn now (n.read || o.markRead) o.archive
         Db.applyOutcomeLabels c.db id o
         ids := ids.push id
     return (fresh, ids)
@@ -125,9 +138,9 @@ end ConnectorCtx
 /-- Re-derive every notification from its raw event with the current normalisers. User state
     (read/archived/starred, manual labels) is kept. Returns `(replayed, failed)`.
 
-    A page of 200 events per transaction, not one for everything: with every message
-    stored whole that takes minutes, and the sources and the API go on writing meanwhile. A replay
-    cut short is simply run again. -/
+    A page of events at a time: each decrypted and normalised on its own -- it can be a whole
+    message -- and then the page written in one short transaction, so the sources and the API
+    go on writing meanwhile. A replay cut short is simply run again. -/
 def replay (db : Db.Conn) (normalizerFor : String → Option Normalizer) (source : Option String) :
     IO (Nat × Nat) := do
   let mut ok := 0
@@ -135,23 +148,21 @@ def replay (db : Db.Conn) (normalizerFor : String → Option Normalizer) (source
   let mut after := 0
   repeat
     let page ← Db.rawEventIds db source after 200
-    let (o, f) ← Db.withTransaction db do
-      let mut o := 0
-      let mut f := 0
-      -- One event at a time, so only one is ever decrypted at once: it can be a whole message.
-      for id in page do
-        let some (rawId, src, externalId, receivedAt, payload) ← Db.rawEvent db id | continue
-        let some normalize := normalizerFor src | f := f + 1; continue
-        match normalize payload with
-        | .ok n =>
-          discard <| Db.upsertNotification db rawId src externalId n receivedAt n.read false
-          o := o + 1
-        | .error e =>
-          log "replay" s!"{src}/{externalId}: {e}"
-          f := f + 1
-      return (o, f)
-    ok := ok + o
-    failed := failed + f
+    let mut prepared := #[]
+    for id in page do
+      let some (rawId, src, externalId, receivedAt, payload) ← Db.rawEvent db id | continue
+      let some normalize := normalizerFor src | failed := failed + 1; continue
+      match normalize payload with
+      | .ok n =>
+        let pn ← Db.prepareNotification src externalId n
+        prepared := prepared.push (rawId, src, receivedAt, n.read, pn)
+      | .error e =>
+        log "replay" s!"{src}/{externalId}: {e}"
+        failed := failed + 1
+    Db.withTransaction db do
+      for (rawId, src, receivedAt, read, pn) in prepared do
+        discard <| Db.upsertPrepared db rawId src pn receivedAt read false
+    ok := ok + prepared.size
     let some last := page.back? | break
     after := last
   return (ok, failed)
