@@ -49,17 +49,39 @@ function fill(el, ...children) {
 
 const $ = (id) => document.getElementById(id);
 
+/** What GET requests last answered, as text, with the server's ETag. Asking again sends the tag,
+    and a 304 means the copy here is current: a refresh that changed nothing costs no transfer,
+    and a list shown before can be shown again at once. In memory only -- the server
+    says no-store, and nothing of the mail is written to disk here either. The oldest go first. */
+const responses = new Map();
+const RESPONSES_KEPT = 100;
+
 async function api(method, path, body) {
+  const kept = method === "GET" ? responses.get(path) : undefined;
+  const headers = body ? { "Content-Type": "application/json" } : {};
+  if (kept) headers["If-None-Match"] = kept.etag;
   const res = await fetch("/api/" + path, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : {},
+    method, headers,
     body: body ? JSON.stringify(body) : undefined,
     credentials: "same-origin",
   });
+  if (res.status === 304 && kept) {
+    responses.delete(path);
+    responses.set(path, kept);
+    return JSON.parse(kept.text);
+  }
   if (res.status === 401 && path !== "login") { showLogin(); throw new Error("unauthorized"); }
-  const data = await res.json().catch(() => ({}));
+  const text = await res.text();
+  let data = {};
+  try { data = JSON.parse(text); } catch (_) { /* not JSON */ }
   if (data.locked && path !== "login") { showLogin(data.error); throw new Error("locked"); }
   if (!res.ok) throw new Error(data.error || res.statusText);
+  const etag = res.headers.get("ETag");
+  if (method === "GET" && etag) {
+    responses.delete(path);
+    responses.set(path, { etag, text });
+    while (responses.size > RESPONSES_KEPT) responses.delete(responses.keys().next().value);
+  }
   return data;
 }
 
@@ -71,6 +93,9 @@ const toB64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
 
 function showLogin(message) {
   events?.close();
+  // Nothing of the mail stays in memory once signed out.
+  responses.clear();
+  fullBodies.clear();
   $("login-error").textContent = message || "";
   $("second-factor").hidden = true;
   $("login-form").hidden = false;
@@ -157,18 +182,26 @@ function query(extra) {
   return p.toString();
 }
 
+/** Load the list: previews, a page at a time. A list shown before shows again at once, from
+    memory, and is then brought up to date -- and drawn again only if it changed. */
 async function loadList(keepSelection) {
-  const selectedId = state.items[state.selected]?.id;
-  const data = await api("GET", "notifications?" + query({ limit: 100 }));
-  state.items = data.notifications;
-  state.next = data.next;
-  state.selected = keepSelection ? state.items.findIndex((n) => n.id === selectedId) : -1;
-  renderList();
+  const selectedId = keepSelection ? state.items[state.selected]?.id : undefined;
+  const path = "notifications?" + query({ limit: 100, preview: 1 });
+  const show = (data) => {
+    state.items = data.notifications;
+    state.next = data.next;
+    state.selected = selectedId === undefined ? -1 : state.items.findIndex((n) => n.id === selectedId);
+    renderList();
+  };
+  const before = responses.get(path)?.text;
+  if (before) show(JSON.parse(before));
+  const data = await api("GET", path);
+  if (responses.get(path)?.text !== before || !before) show(data);
 }
 
 async function loadMore() {
   if (!state.next) return;
-  const data = await api("GET", "notifications?" + query({ limit: 100, before: state.next }));
+  const data = await api("GET", "notifications?" + query({ limit: 100, preview: 1, before: state.next }));
   state.items = state.items.concat(data.notifications);
   state.next = data.next;
   renderList();
@@ -370,9 +403,27 @@ async function update(ids, flags) {
 
 /* ---------- detail ---------- */
 
+/** The list holds previews (a body cut at `PREVIEW_CHARS`); the one opened is fetched
+    whole, once, and kept -- by the response cache, which also answers a later visit with a 304. */
+const PREVIEW_CHARS = 1000;
+const fullBodies = new Map();
+
+function bodyOf(n) {
+  if (fullBodies.has(n.id)) return fullBodies.get(n.id);
+  if ([...n.body].length <= PREVIEW_CHARS) return n.body;
+  fullBodies.set(n.id, null);
+  api("GET", `notifications/${n.id}`).then((full) => {
+    fullBodies.set(n.id, full.body);
+    if (state.items[state.selected]?.id === n.id) renderDetail();
+  }).catch(() => fullBodies.delete(n.id));
+  return null;
+}
+
 function renderDetail() {
   const n = state.items[state.selected];
   if (!n) { fill($("detail")); return; }
+  // The preview until the whole body is here.
+  const body = bodyOf(n) ?? n.body;
   const toggleLabel = async (l, on) => {
     await api(on ? "PUT" : "DELETE", `notifications/${n.id}/labels/${l.id}`);
     n.labels = on ? [...n.labels, l.id] : n.labels.filter((x) => x !== l.id);
@@ -408,7 +459,7 @@ function renderDetail() {
             onchange: (e) => toggleLabel(l, e.target.checked) }),
           h("span", { class: "dot", style: { background: l.color } }), l.name))),
       attachmentList(n)),
-    h("div", { class: "body" }, n.body.trim() ? renderMessage(n.body) : h("p", { class: "hint" }, "No text.")));
+    h("div", { class: "body" }, body.trim() ? renderMessage(body) : h("p", { class: "hint" }, "No text.")));
 }
 
 /** A byte count as people read it: 812 B, 4.2 KB, 31 MB. */

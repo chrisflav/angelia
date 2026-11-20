@@ -378,7 +378,8 @@ def listNotifications (ctx : AppContext) (scope : Scope) (r : Req) : ApiM ApiRes
     q := nonEmpty "q", source := nonEmpty "source", thread := nonEmpty "thread"
     label := ← num "label", before, sort
     state := (nonEmpty "state").getD "inbox"
-    limit := ((← num "limit").map Int.toNat).getD 100 }
+    limit := ((← num "limit").map Int.toNat).getD 100
+    preview := ["1", "true"].contains ((r.query "preview").getD "") }
   let ns ← ctx.dbM (Db.listNotifications · scope f)
   ok (Json.mkObj [("notifications", toJson ns),
     ("next", toJson (if ns.size < f.limit then none
@@ -716,12 +717,24 @@ def runApi (ctx : AppContext) (r : Req) : IO ApiResponse := do
 def headerValue (r : Request Body.Stream) (name : String) : Option String :=
   (Header.Name.ofString? name).bind (r.line.headers.get? ·) |>.map toString
 
-def buildResponse (r : ApiResponse) : Async (Response Body.Full) :=
+/-- A JSON answer, with an `ETag` from its content when it is a successful read: a client that
+    sends it back in `If-None-Match` and has the same gets `304` and no body, which is what keeps
+    a refresh that changed nothing cheap. `no-store` stays: the client keeps what it shows in
+    memory, and nothing of the mail reaches a browser's disk cache. -/
+def buildResponse (r : ApiResponse) (method : Method) (ifNoneMatch : Option String) :
+    Async (Response Body.Full) :=
   let base := Response.withStatus r.status |>.header! "Cache-Control" "no-store"
   let b := r.headers.foldl (fun b (k, v) => b.header! k v) base
   match r.bytes with
   | some bytes => b.fromBytes bytes
-  | none => b.json r.body.compress
+  | none =>
+    let body := r.body.compress
+    if method != .get || r.status != .ok then b.json body else
+    let tag := s!"W/\"{body.hash}\""
+    if ifNoneMatch == some tag then
+      (Response.withStatus .notModified |>.header! "Cache-Control" "no-store"
+        |>.header! "ETag" tag).text ""
+    else (b.header! "ETag" tag).json body
 
 def contentTypeOf (name : String) : String :=
   if name.endsWith ".html" then "text/html; charset=utf-8"
@@ -803,7 +816,8 @@ instance : Handler AppHandler where
       let r : Req := { method := req.line.method, segments := rest
                        query := fun k => req.line.uri.query.get k, body
                        header := headerValue req }
-      return ((← buildResponse (← (runApi h.ctx r : IO ApiResponse)) : Response Body.Full) :
+      let resp ← (runApi h.ctx r : IO ApiResponse)
+      return ((← buildResponse resp r.method (r.header "if-none-match") : Response Body.Full) :
         Response Body.Any)
     | _ => return ((← serveStatic h.ctx segs : Response Body.Full) : Response Body.Any)
   onFailure _ err := do
