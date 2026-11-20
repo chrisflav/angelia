@@ -55,6 +55,10 @@ def schemaSql : String := "
   );
   CREATE INDEX IF NOT EXISTS notification_order ON notification (archived, received_at DESC);
   CREATE INDEX IF NOT EXISTS notification_thread ON notification (source, thread_key);
+  -- Every column a list filters and sorts on, so choosing a page never reads the rows: their
+  -- sealed content comes before these columns, and reading past a large one means reading it.
+  CREATE INDEX IF NOT EXISTS notification_list ON notification
+    (archived, outgoing, read, starred, source, thread_key, sent_at, received_at);
 
   CREATE TABLE IF NOT EXISTS label (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -378,13 +382,20 @@ structure Filter where
   /-- Keyset pagination: only rows after this `(time, id)` in the sort order. -/
   before : Option (Int × Int) := none
   limit : Nat := 100
+  /-- Bodies cut to `previewChars`, for a list that shows a line of each and fetches the one
+      opened whole. A text search still matches on the whole body. -/
+  preview : Bool := false
 deriving Inhabited
 
 /-- The scope's time limit as an SQL argument, evaluated now: a window moves with the clock. -/
 private def scopeMinTime (scope : Scope) : IO (Option Int64) := do
   return (scope.minTime (← nowSeconds)).map Int64.ofInt
 
-/-- One page of a notification query without the text search, in the filter's sort order. -/
+/-- One page of a notification query without the text search, in the filter's sort order.
+
+    In two steps, in one statement: the page is chosen sorting only ids and times, and only its
+    rows are then read whole. Sorting the rows themselves -- every notification's sealed content
+    carried through the sort to keep a hundred -- took seconds once the mailboxes were in. -/
 private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
     IO (Array NotificationRow) := do
   let (srcs, lbls) := scope.sqlArgs
@@ -393,9 +404,11 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
   let bt := f.before.map (i64 ·.1)
   let bid := f.before.map (i64 ·.2)
   let limit : Int64 := Int64.ofNat limit
-  (← db query!"SELECT * FROM (SELECT n.id, n.source, n.external_id, n.kind, n.thread_key,
+  (← db query!"SELECT n.id, n.source, n.external_id, n.kind, n.thread_key,
       n.content, n.sent_at, n.received_at, n.read, n.archived, n.starred,
       (SELECT group_concat(label_id) FROM notification_label WHERE notification_id = n.id),
+      page.t
+    FROM (SELECT id, t FROM (SELECT n.id,
       CASE WHEN {f.sort} = 'arrived' OR n.sent_at IS NULL OR n.sent_at > n.received_at
         THEN n.received_at ELSE n.sent_at END AS t
     FROM notification n
@@ -420,29 +433,42 @@ private def queryPage (db : Conn) (scope : Scope) (f : Filter) (limit : Nat) :
       ELSE t < {bt} OR (t = {bt} AND id < {bid}) END
     ORDER BY CASE WHEN {f.sort} = 'oldest' THEN t ELSE -t END,
       CASE WHEN {f.sort} = 'oldest' THEN id ELSE -id END
-    LIMIT {limit}" as NotificationRow).toArray
+    LIMIT {limit}) page
+    JOIN notification n ON n.id = page.id
+    ORDER BY CASE WHEN {f.sort} = 'oldest' THEN page.t ELSE -page.t END,
+      CASE WHEN {f.sort} = 'oldest' THEN n.id ELSE -n.id END" as NotificationRow).toArray
+
+/-- How much of a body a preview keeps: enough for the line a list shows of it. -/
+def previewChars : Nat := 1000
 
 /-- Run a notification query, newest first. A text search (case-insensitive, on title, body,
-    author and attachment names) decrypts candidates page by page until it has `limit` matches. -/
+    author and attachment names) decrypts candidates page by page until it has `limit` matches.
+    With `preview`, the bodies are cut (`previewChars`) once matched. -/
 def listNotifications (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notification) := do
-  let k ← Vault.keys
-  let limit := min f.limit 500
-  let some q := f.q.map String.toLower
-    | (← queryPage db scope f limit).mapM (·.toNotification k)
-  let pageSize := 500
-  let mut out := #[]
-  let mut f := f
-  repeat
-    let rows ← queryPage db scope f pageSize
-    for r in rows do
-      let n ← r.toNotification k
-      let hit (s : String) := (s.toLower.splitOn q).length > 1
-      if out.size < limit && (hit n.data.title || hit n.data.body || hit n.data.author
-          || n.data.attachments.any (hit ·.name)) then
-        out := out.push n
-    if rows.size < pageSize || out.size ≥ limit then break
-    f := { f with before := rows.back?.map fun r => (r.time.toInt, r.id.toInt) }
-  return out
+  let ns ← listMatching db scope f
+  if !f.preview then return ns
+  return ns.map fun n =>
+    { n with data := { n.data with body := truncate n.data.body previewChars } }
+where
+  listMatching (db : Conn) (scope : Scope) (f : Filter) : IO (Array Notification) := do
+    let k ← Vault.keys
+    let limit := min f.limit 500
+    let some q := f.q.map String.toLower
+      | (← queryPage db scope f limit).mapM (·.toNotification k)
+    let pageSize := 500
+    let mut out := #[]
+    let mut f := f
+    repeat
+      let rows ← queryPage db scope f pageSize
+      for r in rows do
+        let n ← r.toNotification k
+        let hit (s : String) := (s.toLower.splitOn q).length > 1
+        if out.size < limit && (hit n.data.title || hit n.data.body || hit n.data.author
+            || n.data.attachments.any (hit ·.name)) then
+          out := out.push n
+      if rows.size < pageSize || out.size ≥ limit then break
+      f := { f with before := rows.back?.map fun r => (r.time.toInt, r.id.toInt) }
+    return out
 
 /-- A notification, if it exists and is visible under `scope`. -/
 def getNotification (db : Conn) (scope : Scope) (id : Int) : IO (Option Notification) := do
